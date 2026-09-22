@@ -25,6 +25,8 @@
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/mhchem.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+    <!-- jsPDF untuk unduhan PDF per judul soal -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
@@ -296,7 +298,13 @@
             const esc=v=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
             const interpretation=p=>p>=80?'Sangat tinggi':p>=60?'Tinggi':p>=40?'Sedang':'Rendah';
             let html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><style>table{border-collapse:collapse}th,td{border:1px solid #777;padding:5px;vertical-align:top}th{background:#dbeafe;font-weight:bold}.title{font-size:16pt;font-weight:bold}</style></head><body>';
-            html+=`<p class="title">ANALISIS HASIL NILAI PER BUTIR SOAL</p><p><b>Judul:</b> ${esc(title)} &nbsp; <b>Jumlah Peserta:</b> ${data.length}</p><p><b>Dasar analisis:</b> metadata butir mencakup Submateri/Sub-elemen dan Cakupan Sub-elemen Matematika.</p>`;
+            const subjectsInAnalysis = [...new Set(data.flatMap(r => (r.questionAnalysis || []).map(item => item.subject).filter(Boolean)))];
+            const analysisBasis = subjectsInAnalysis.length === 1 && subjectsInAnalysis[0] === 'Matematika'
+                ? 'metadata butir Matematika mencakup Materi/Elemen, Submateri/Sub-elemen, Cakupan Sub-elemen, Kompetensi, Level Kognitif, dan Proses Berpikir.'
+                : subjectsInAnalysis.length === 1 && subjectsInAnalysis[0] === 'Bahasa Indonesia'
+                    ? 'metadata butir Bahasa Indonesia mencakup Materi/Elemen, Subkompetensi, Kompetensi, Level Kognitif, dan Proses Berpikir. Cakupan Sub-elemen Matematika tidak digunakan.'
+                    : 'metadata butir disesuaikan dengan mata pelajaran masing-masing; Cakupan Sub-elemen digunakan untuk Matematika, sedangkan Bahasa Indonesia menggunakan Subkompetensi.';
+            html+=`<p class="title">ANALISIS HASIL NILAI PER BUTIR SOAL</p><p><b>Judul:</b> ${esc(title)} &nbsp; <b>Jumlah Peserta:</b> ${data.length}</p><p><b>Dasar analisis:</b> ${esc(analysisBasis)}</p>`;
             html+='<table><thead><tr><th>No</th><th>Mata Pelajaran</th><th>Judul Soal</th><th>Bentuk Soal</th><th>Kompetensi</th><th>Subkompetensi</th><th>Materi/Elemen</th><th>Submateri/Sub-elemen</th><th>Cakupan Sub-elemen</th><th>Level Kognitif</th><th>Proses Berpikir</th><th>Peserta</th><th>Benar</th><th>Salah</th><th>Kosong</th><th>% Benar</th><th>Interpretasi</th></tr></thead><tbody>';
             rows.forEach(a=>{const pct=a.participants?a.correct/a.participants*100:0; html+=`<tr><td>${esc(a.no)}</td><td>${esc(a.subject)}</td><td>${esc(a.title)}</td><td>${esc(a.type)}</td><td>${esc(a.competency)}</td><td>${esc(a.subcompetency)}</td><td>${esc(a.material)}</td><td>${esc(a.submaterial)}</td><td>${esc(a.coverage)}</td><td>${esc(a.cognitive)}</td><td>${esc(a.thinking)}</td><td>${a.participants}</td><td>${a.correct}</td><td>${a.wrong}</td><td>${a.blank}</td><td>${pct.toFixed(2)}%</td><td>${interpretation(pct)}</td></tr>`;});
             html+='</tbody></table></body></html>';
@@ -394,6 +402,173 @@
             // Kunci jawaban dan pembahasan dipindahkan ke bagian khusus di bawah seluruh soal.
             body += `</div>`;
             return body;
+        };
+
+        // ============================================================
+        // UNDUH PDF: NASKAH SOAL + KUNCI + PEMBAHASAN + KISI-KISI
+        // Diunduh khusus untuk setiap judul soal.
+        // ============================================================
+        const pdfPlain = (value) => String(value ?? '')
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+            .trim();
+
+        const pdfSafeFileName = (value) => String(value || 'TKA_SD')
+            .replace(/[\\/:*?"<>|]/g, '-')
+            .replace(/\s+/g, '_')
+            .slice(0, 120);
+
+        const downloadPdfQuestions = (questions, title = 'TKA_SD') => {
+            if (!Array.isArray(questions) || !questions.length) {
+                alert('Belum ada soal pada judul ini untuk diunduh.');
+                return;
+            }
+            if (!window.jspdf || !window.jspdf.jsPDF) {
+                alert('Komponen PDF belum siap. Pastikan koneksi internet aktif, lalu coba lagi.');
+                return;
+            }
+
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            const pageWidth = doc.internal.pageSize.getWidth();
+            const pageHeight = doc.internal.pageSize.getHeight();
+            const margin = 15;
+            const textWidth = pageWidth - margin * 2;
+            let y = margin;
+            let questionNo = 0;
+
+            const safeText = (value) => pdfPlain(value).replace(/\t/g, ' ');
+            const addPageIfNeeded = (needed = 8) => {
+                if (y + needed > pageHeight - 15) {
+                    doc.addPage();
+                    y = margin;
+                }
+            };
+            const addWrapped = (text, opts = {}) => {
+                const size = opts.size || 10.5;
+                const bold = !!opts.bold;
+                const indent = opts.indent || 0;
+                const gap = opts.gap == null ? 4 : opts.gap;
+                const x = margin + indent;
+                doc.setFont('helvetica', bold ? 'bold' : 'normal');
+                doc.setFontSize(size);
+                const lines = doc.splitTextToSize(safeText(text), textWidth - indent);
+                const lineH = size * 0.43 + 1.6;
+                for (const line of lines) {
+                    addPageIfNeeded(lineH + 1);
+                    doc.text(line, x, y);
+                    y += lineH;
+                }
+                y += gap;
+            };
+            const addHeading = (text, size = 14) => {
+                addPageIfNeeded(12);
+                doc.setFont('helvetica', 'bold');
+                doc.setFontSize(size);
+                doc.text(safeText(text), margin, y);
+                y += size * 0.5 + 4;
+            };
+            const addRule = () => {
+                addPageIfNeeded(4);
+                doc.setDrawColor(180);
+                doc.line(margin, y, pageWidth - margin, y);
+                y += 4;
+            };
+            const addImage = (src, maxW = 100, maxH = 60) => {
+                if (!src || typeof src !== 'string') return;
+                try {
+                    let format = 'PNG';
+                    if (/^data:image\/jpe?g/i.test(src)) format = 'JPEG';
+                    else if (/^data:image\/webp/i.test(src)) format = 'WEBP';
+                    else if (/^data:image\/svg\+xml/i.test(src)) format = 'SVG';
+                    // SVG dapat gagal pada beberapa browser/jsPDF; PNG/JPEG tetap diprioritaskan.
+                    if (format === 'SVG') return;
+                    const props = doc.getImageProperties(src);
+                    let w = maxW;
+                    let h = w * (props.height / props.width);
+                    if (h > maxH) { h = maxH; w = h * (props.width / props.height); }
+                    addPageIfNeeded(h + 6);
+                    doc.addImage(src, format, margin, y, w, h, undefined, 'FAST');
+                    y += h + 5;
+                } catch (e) {
+                    // Gambar yang tidak dapat dikonversi tidak menghentikan pembuatan PDF.
+                }
+            };
+
+            addHeading('NASKAH SOAL TKA SD', 16);
+            addWrapped(`Judul Soal: ${title}`, { size: 12, bold: true, gap: 2 });
+            const subjects = [...new Set(questions.map(getQuestionSubject))];
+            addWrapped(`Mata Pelajaran: ${subjects.join(', ')}`, { size: 10.5, gap: 3 });
+            addRule();
+
+            questions.forEach((q) => {
+                questionNo += 1;
+                addHeading(`Soal ${questionNo}`, 12.5);
+                addWrapped(`Mata Pelajaran: ${getQuestionSubject(q)}`, { size: 9.5, gap: 1 });
+                if (q?.stimulus) {
+                    addWrapped(`Stimulus${q.stimulusTitle ? ': ' + q.stimulusTitle : ''}`, { size: 9.5, bold: true, gap: 1 });
+                    addWrapped(q.stimulus, { size: 10, indent: 4, gap: 2 });
+                }
+                if (q?.image) addImage(q.image);
+                addWrapped(q?.text || '', { size: 10.5, bold: true, gap: 3 });
+
+                if (Array.isArray(q?.options) && q.options.length) {
+                    q.options.forEach((o, i) => {
+                        addWrapped(`${String.fromCharCode(65 + i)}. ${o}`, { size: 10, indent: 4, gap: 1.5 });
+                        if (q.optionImages?.[i]) addImage(q.optionImages[i], 70, 40);
+                    });
+                    y += 2;
+                }
+                if (Array.isArray(q?.statements) && q.statements.length) {
+                    q.statements.forEach((st, i) => {
+                        addWrapped(`${i + 1}. ${st?.text || ''}`, { size: 10, indent: 4, gap: 1 });
+                    });
+                    y += 2;
+                }
+                addRule();
+            });
+
+            // Kunci dan pembahasan
+            addHeading('KUNCI JAWABAN DAN PEMBAHASAN', 14);
+            questionNo = 0;
+            questions.forEach((q) => {
+                questionNo += 1;
+                const key = Array.isArray(q?.correct)
+                    ? q.correct.join('; ')
+                    : (q?.correct || (Array.isArray(q?.statements)
+                        ? q.statements.map(s => s.correct ? 'Benar' : 'Salah').join(', ')
+                        : 'Belum diisi'));
+                addWrapped(`Soal ${questionNo} — Kunci Jawaban: ${key}`, { size: 10, bold: true, gap: 2 });
+                addWrapped(`Pembahasan: ${q?.explanation ? q.explanation : 'Pembahasan belum tersedia.'}`, { size: 10, gap: 4 });
+            });
+
+            // Kisi-kisi per butir
+            addHeading('KISI-KISI SOAL', 14);
+            questions.forEach((q, i) => {
+                addHeading(`Butir ${i + 1}`, 11.5);
+                const subject = getQuestionSubject(q);
+                const fields = [
+                    ['Mata Pelajaran', subject],
+                    ['Jenis Soal', getWordQuestionType(q)],
+                    ['Bentuk Soal', getWordForm(q)],
+                    ['Materi/Elemen', getWordMaterial(q)]
+                ];
+                if (subject === 'Matematika') {
+                    fields.push(['Submateri/Sub-elemen', getWordSubmaterial(q)]);
+                    fields.push(['Cakupan Sub-elemen', q?.cakupanSubelemen || q?.coverage || 'Belum diisi']);
+                } else {
+                    fields.push(['Subkompetensi', getWordSubcompetency(q)]);
+                }
+                fields.push(['Kompetensi', getWordCompetency(q)]);
+                fields.push(['Level Kognitif', getWordCognitive(q)]);
+                fields.push(['Proses Berpikir', getWordThinking(q)]);
+                fields.forEach(([label, value]) => addWrapped(`${label}: ${value}`, { size: 9.5, indent: 4, gap: 1.5 }));
+                y += 2;
+            });
+
+            doc.save(`Naskah_Soal_${pdfSafeFileName(title)}_${new Date().toISOString().slice(0,10)}.pdf`);
         };
 
         const downloadWordQuestions = (questions, title = 'TKA_SD') => {
@@ -979,35 +1154,97 @@ ${answerHtml}
 ATURAN MUTU WAJIB: 1) Setiap soal harus memiliki tujuan ukur yang jelas dan benar-benar sesuai level kognitif yang diminta. 2) Hindari soal hafalan langsung, angka terlalu sederhana, kalimat generik, dan pola soal yang sama berulang. 3) Untuk Matematika, utamakan stimulus/konteks yang realistis dan minimal 2 langkah berpikir untuk Aplikasi/Penalaran; data harus cukup untuk menyelesaikan masalah dan semua opsi harus masuk akal sebagai pengecoh yang berasal dari kesalahan umum, bukan opsi asal. 4) Untuk Penalaran, minta siswa membandingkan, menghubungkan informasi, memilih strategi, menafsirkan hasil, atau mengevaluasi pernyataan. 5) Untuk Bahasa Indonesia, gunakan stimulus 150–200 kata untuk soal grup/tunggal yang berbasis bacaan; pertanyaan harus dapat dijawab dari teks tetapi tidak sekadar menyalin kalimat. Variasikan pertanyaan tentang informasi tersurat, inferensi, ide pokok/gagasan pendukung, kosakata dalam konteks, hubungan sebab-akibat, kesesuaian informasi, dan evaluasi/relevansi. 6) Jika itemType=Grup, buat satu stimulus yang cukup kaya untuk 3 soal yang berbeda dan saling terkait, bukan tiga pertanyaan yang identik. 7) Hindari petunjuk jawaban dari panjang opsi, kata yang berulang secara mencolok, atau pilihan yang jelas salah. 8) Pastikan hanya ada satu jawaban benar untuk single; MCMA memiliki sedikitnya dua jawaban benar; kategori memiliki kombinasi benar/salah yang dapat dibuktikan. 9) explanation harus menjelaskan langkah penalaran, bukan hanya menyebut kunci. 10) Jika soal membutuhkan diagram, tabel, bangun, denah, posisi, pecahan bergambar, atau visualisasi ruang, imageRequired=true dan WAJIB membuat SVG mandiri pada imageSvg. Gambar harus benar-benar diperlukan untuk menyelesaikan soal, memiliki label/angka yang konsisten dengan stimulus, dan tidak dekoratif. 11) Jangan menggunakan URL gambar eksternal. 12) Jangan mengklaim soal sebagai soal resmi pemerintah. 13) KHUSUS MATEMATIKA: jika cakupanSubelemen bukan "Semua cakupan pada sub-elemen", setiap butir wajib mengukur cakupan yang dipilih secara substantif. Jangan hanya menyalin label cakupan. Jika semua cakupan dipilih, distribusikan butir pada cakupan yang tersedia secara wajar.
 
 SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,statements,explanation,subject,element,subelement,competency,subcompetency,cakupanSubelemen,coverage,cognitiveLevel,thinkingProcess,itemType,imageSvg,imageAlt,imageRequired,imageDescription,optionImageSvgs. Untuk single tepat 4 opsi dan correct berupa teks opsi. Untuk complex minimal 4 opsi dan correct berupa array teks opsi benar. Untuk statement statements berisi objek text dan correct boolean. Kembalikan hanya JSON valid tanpa markdown. Sebelum mengembalikan, lakukan pemeriksaan internal: hitung ulang semua angka, cek kunci terhadap opsi/pernyataan, cek konsistensi stimulus-gambar, cek level kognitif, cek tidak ada opsi duplikat, dan cek bahwa soal tidak dangkal.`;
-                        const aiUrl='https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key='+encodeURIComponent(apiKey.trim());
-                        const aiBody={contents:[{parts:[{text:prompt}]}],generationConfig:{temperature:0.65,responseMimeType:'application/json'}};
-                        let response=null, data=null, lastAiError=null;
-                        const maxAttempts=3;
-                        for(let attempt=1; attempt<=maxAttempts; attempt++){
-                            try{
-                                if(attempt>1){
-                                    const waitMs=1800*Math.pow(2,attempt-2);
-                                    setStatus(`Layanan AI sedang padat. Mencoba kembali (${attempt}/${maxAttempts})...`);
-                                    await new Promise(resolve=>setTimeout(resolve,waitMs));
-                                }
-                                response=await fetch(aiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiBody)});
-                                data=await response.json().catch(()=>({}));
-                                if(response.ok) break;
-                                const msg=data.error?.message||`Layanan AI gagal (HTTP ${response.status}).`;
-                                lastAiError=new Error(msg);
-                                if(![408,425,429,500,502,503,504].includes(response.status)) throw lastAiError;
-                            }catch(fetchError){
-                                lastAiError=fetchError;
-                                if(attempt===maxAttempts) throw fetchError;
-                            }
-                        }
-                        if(!response || !response.ok) throw (lastAiError||new Error('Layanan AI tidak merespons.'));
-                        const text=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
-                        if(!text.trim()) throw new Error('AI tidak mengembalikan isi soal. Periksa API key, kuota, dan koneksi internet.');
-                        let cleaned=text.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim();
-                        let parsed; try { parsed=JSON.parse(cleaned); } catch(e) { throw new Error('AI mengembalikan format JSON yang tidak valid. Silakan regenerasi.'); }
-                        raw=Array.isArray(parsed)?parsed:(Array.isArray(parsed.questions)?parsed.questions:[]);
-                        if(!raw.length) throw new Error('AI tidak menghasilkan daftar soal. Silakan coba lagi dengan jumlah soal lebih sedikit.');
+                        // Fallback model otomatis khusus GENERATOR SOAL TKA (bukan TRYOUT).
+                         // Urutan: model utama -> model Flash -> Flash-Lite.
+                         const aiModels = [
+                             'gemini-3.6-flash',
+                             'gemini-3.5-flash',
+                             'gemini-3.5-flash-lite',
+                             'gemini-3.1-flash-lite'
+                         ];
+                         const aiBody={contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json'}};
+                         let response=null, data=null, lastAiError=null, usedModel='', parsed=null;
+
+                         const isRetryableAiFailure = (status, msg='') => {
+                             const s=String(msg||'').toLowerCase();
+                             return [408,425,429,500,502,503,504].includes(Number(status))
+                                 || /high demand|spikes in demand|currently experiencing high demand|quota exceeded|rate limit|too many requests|temporarily unavailable|service unavailable/i.test(s);
+                         };
+
+                         for(let modelIndex=0; modelIndex<aiModels.length && !raw.length; modelIndex++){
+                             const model=aiModels[modelIndex];
+                             const aiUrl=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+
+                             for(let attempt=1; attempt<=2 && !raw.length; attempt++){
+                                 try{
+                                     if(modelIndex>0){
+                                         setStatus(`Model ${aiModels[modelIndex-1]} sedang padat/gagal. Beralih otomatis ke ${model} (${modelIndex+1}/${aiModels.length})...`);
+                                     } else if(attempt>1){
+                                         setStatus(`Model ${model} sedang padat. Mencoba kembali (${attempt}/2)...`);
+                                     }
+
+                                     if(attempt>1) {
+                                         await new Promise(resolve=>setTimeout(resolve,1800*Math.pow(2,attempt-2)));
+                                     }
+
+                                     response=await fetch(aiUrl,{
+                                         method:'POST',
+                                         headers:{'Content-Type':'application/json'},
+                                         body:JSON.stringify(aiBody)
+                                     });
+
+                                     data=await response.json().catch(()=>({}));
+
+                                     if(!response.ok){
+                                         const msg=data.error?.message||`Layanan AI gagal (HTTP ${response.status}).`;
+                                         lastAiError=new Error(msg);
+                                         if(!isRetryableAiFailure(response.status,msg)) throw lastAiError;
+                                         continue;
+                                     }
+
+                                     const candidateText=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+                                     if(!candidateText.trim()){
+                                         lastAiError=new Error(`Model ${model} tidak mengembalikan isi soal.`);
+                                         continue;
+                                     }
+
+                                     const cleaned=candidateText.trim()
+                                         .replace(/^```(?:json)?\s*/i,'')
+                                         .replace(/\s*```$/,'')
+                                         .trim();
+
+                                     try{
+                                         parsed=JSON.parse(cleaned);
+                                     }catch(jsonError){
+                                         lastAiError=new Error(`Model ${model} mengembalikan JSON tidak valid.`);
+                                         continue;
+                                     }
+
+                                     const candidateRaw=Array.isArray(parsed)
+                                         ? parsed
+                                         : (Array.isArray(parsed.questions)?parsed.questions:[]);
+
+                                     if(!candidateRaw.length){
+                                         lastAiError=new Error(`Model ${model} tidak menghasilkan daftar soal.`);
+                                         continue;
+                                     }
+
+                                     raw=candidateRaw;
+                                     usedModel=model;
+                                 }catch(fetchError){
+                                     lastAiError=fetchError;
+                                     if(!isRetryableAiFailure(fetchError?.status,fetchError?.message)) throw fetchError;
+                                 }
+                             }
+                         }
+
+                         if(!raw.length) {
+                             throw (lastAiError||new Error('Semua model AI gagal merespons.'));
+                         }
+
+                         if(usedModel && usedModel!==aiModels[0]){
+                             setStatus(`Berhasil membuat soal menggunakan model cadangan ${usedModel} karena model utama sedang padat/gagal.`);
+                         }
                     }
                     const normalized=raw.map((q,i)=>normalizeAIQuestion({...q, subelement:subject==='Matematika'?subSelection:'', subcompetency:subject==='Bahasa Indonesia'?subSelection:'', cakupanSubelemen:subject==='Matematika'?(q.cakupanSubelemen||q.coverage||coverageSelection||'Semua cakupan pada sub-elemen'):'', coverage:subject==='Matematika'?(q.coverage||q.cakupanSubelemen||coverageSelection||'Semua cakupan pada sub-elemen'):''},i));
                     const checked=normalized.map((q,i)=>({q:repairQuestionForValidation(q),issues:validateAIQuestion(q),index:i}));
@@ -1044,7 +1281,7 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                 if(rejected>0 && !window.confirm(`${rejected} soal belum lolos validasi mutu dan tidak akan dimasukkan. Lanjutkan hanya dengan ${good.length} soal yang lolos?`)) return;
                 onGenerate(good);
             };
-            return <div className="fixed inset-0 z-[70] bg-black bg-opacity-50 flex items-center justify-center p-4 fade-in"><div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] overflow-y-auto"><div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white z-10"><div><h3 className="text-xl font-extrabold text-gray-800">🤖 Generator Soal TKA SD</h3><p className="text-xs text-gray-500 mt-1">AI Gemini dengan API key milik sekolah. Gambar yang diperlukan dibuat otomatis oleh AI, lalu diperiksa oleh validator lokal dan generator cadangan.</p></div><button onClick={onCancel}><X size={24}/></button></div><div className="p-6 space-y-5"><div className="grid md:grid-cols-3 gap-4"><div><label className="block text-sm font-bold mb-1">Mata Uji</label><select value={subject} onChange={e=>{const nextSubject=e.target.value;const nextElement=nextSubject==='Matematika'?'Bilangan':'Keterampilan Membaca';const nextCompetency=nextSubject==='Matematika'?'Pemecahan masalah matematis':'Pemahaman Tekstual';setSubject(nextSubject);setElement(nextElement);setCompetency(nextCompetency);const nextSub=nextSubject==='Matematika'?(TKA_META.mathSubelements[nextElement]||[])[0]||'':(TKA_META.biSubcompetencies[nextCompetency]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection(nextSubject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg"><option>Matematika</option><option>Bahasa Indonesia</option></select></div><div><label className="block text-sm font-bold mb-1">Elemen</label>{subject==='Matematika'?<select value={element} onChange={e=>{const nextElement=e.target.value;setElement(nextElement);const nextSub=(TKA_META.mathSubelements[nextElement]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection((TKA_META.mathCoverage[nextSub]||[])[0]||'')}} className="w-full p-3 border rounded-lg">{TKA_META.mathElements.map(x=><option key={x}>{x}</option>)}</select>:<input readOnly value="Keterampilan Membaca" className="w-full p-3 border rounded-lg bg-gray-50"/>}</div><div><label className="block text-sm font-bold mb-1">Level Kognitif</label><select value={level} onChange={e=>{setLevel(e.target.value);setThinkingProcess(TKA_META.cognitive[e.target.value][0])}} className="w-full p-3 border rounded-lg">{Object.keys(TKA_META.cognitive).map(x=><option key={x}>{x}</option>)}</select></div><div><label className="block text-sm font-bold mb-1">Kompetensi</label><select value={competency} onChange={e=>{setCompetency(e.target.value);const next=subject==='Bahasa Indonesia'?(TKA_META.biSubcompetencies[e.target.value]||[]):(TKA_META.mathSubelements[element]||[]);const nextSub=next[0]||'';setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{(subject==='Matematika'?['Pengetahuan matematika','Representasi matematis','Penalaran','Pemecahan masalah matematis','Koneksi matematis']:TKA_META.biCompetencies).map(x=><option key={x}>{x}</option>)}</select></div><div className="md:col-span-3"><label className="block text-sm font-bold mb-1">{subject==='Bahasa Indonesia'?'Subkompetensi':'Sub-elemen / Submateri'}</label><select value={subSelection} onChange={e=>{const nextSub=e.target.value;setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{availableSubSelections.map(x=><option key={x}>{x}</option>)}{availableSubSelections.length===0&&<option value="">Tidak tersedia</option>}</select><p className="text-xs text-gray-500 mt-1">Pilihan mengikuti kompetensi/elemen yang dipilih dan kerangka TKA SD.</p></div>{subject==='Matematika'&&<div className="md:col-span-3"><label className="block text-sm font-bold mb-1">Pilihan Cakupan Sub-elemen</label><select value={coverageSelection} onChange={e=>setCoverageSelection(e.target.value)} className="w-full p-3 border rounded-lg"><option value="">Semua cakupan pada sub-elemen</option>{availableCoverages.map(x=><option key={x} value={x}>{x}</option>)}</select><p className="text-xs text-gray-500 mt-1">Pilih cakupan sesuai tabel kerangka TKA SD. Cakupan ini menjadi dasar pembuatan dan analisis butir Matematika.</p></div>}<div className="md:col-span-3 border rounded-xl p-4 bg-gray-50"><label className="block text-sm font-bold mb-2">Bentuk Soal dan Jumlah Soal</label><p className="text-xs text-gray-500 mb-3">Pilih jumlah masing-masing bentuk soal. Semua bentuk dapat dibuat sekaligus pada kompetensi yang dipilih.</p><div className="grid md:grid-cols-3 gap-3"><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PG Sederhana</div><div className="text-xs text-gray-500 mb-2">1 jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.single} onChange={e=>setTypeCount('single',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK MCMA</div><div className="text-xs text-gray-500 mb-2">lebih dari satu jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.complex} onChange={e=>setTypeCount('complex',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK Kategori</div><div className="text-xs text-gray-500 mb-2">pernyataan benar/salah</div><input type="number" min="0" max="20" value={questionCounts.statement} onChange={e=>setTypeCount('statement',e.target.value)} className="w-full p-2 border rounded-lg"/></div></div><div className="mt-3 text-sm font-bold text-indigo-700">Total soal: {totalCount} / 20</div></div><div><label className="block text-sm font-bold mb-1">Kesulitan</label><select value={difficulty} onChange={e=>setDifficulty(e.target.value)} className="w-full p-3 border rounded-lg"><option>Mudah</option><option>Sedang</option><option>Sulit</option></select></div><div><label className="block text-sm font-bold mb-1">Jenis</label><select value={itemType} onChange={e=>setItemType(e.target.value)} className="w-full p-3 border rounded-lg"><option>Tunggal</option><option>Grup</option></select></div><div><label className="block text-sm font-bold mb-1">Sumber Generator</label><select value={mode} onChange={e=>setMode(e.target.value)} className="w-full p-3 border rounded-lg"><option value="ai">AI Gemini (API Key Sekolah)</option><option value="local">Lokal / Cadangan</option></select></div><div><label className="block text-sm font-bold mb-1">API Key AI</label><input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="API key Gemini sekolah" className="w-full p-3 border rounded-lg"/><label className="text-xs text-gray-500 flex items-center gap-2 mt-1"><input type="checkbox" checked={showKey} onChange={e=>setShowKey(e.target.checked)}/> Tampilkan key</label><p className="text-xs text-orange-700 mt-1">Jangan bagikan file HTML yang berisi key. Key hanya disimpan selama sesi browser.</p></div></div><div><label className="block text-sm font-bold mb-1">Topik atau konteks tambahan (opsional)</label><input value={topic} onChange={e=>setTopic(e.target.value)} placeholder="Contoh: lingkungan sekolah, pecahan, diagram batang" className="w-full p-3 border rounded-lg"/></div>{status&&<div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-sm text-blue-900">{status}</div>}{preview.length>0&&<div className="space-y-3"><div className="flex justify-between items-center"><h4 className="font-bold">Hasil AI</h4><button onClick={generate} disabled={busy} className="px-3 py-2 rounded-lg bg-amber-500 text-white font-bold">Regenerasi</button></div>{preview.map(({q,issues},i)=><div key={q.id} className="border rounded-xl p-4"><div className="flex justify-between gap-3"><b>Soal {i+1}</b>{issues.length?<span className="text-xs bg-orange-100 text-orange-800 px-2 py-1 rounded">{issues.length} masalah</span>:<span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">Lolos validasi dasar</span>}</div><p className="mt-2 text-sm whitespace-pre-wrap">{q.text}</p>{q.image&&<div className="mt-3 rounded-lg border bg-gray-50 p-2"><div className="text-xs font-semibold text-gray-500 mb-2">Gambar dibuat otomatis oleh AI</div><img src={q.image} alt={q.imageAlt||"Gambar pendukung soal"} className="max-w-full max-h-64 mx-auto object-contain" /></div>}{q.imageRequired&&!q.image&&<div className="mt-3 text-xs text-orange-700 bg-orange-50 border border-orange-200 rounded-lg p-2">AI menandai soal ini membutuhkan gambar, tetapi gambar belum berhasil dibuat. Silakan regenerasi.</div>}{q.options.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.options.map((o,j)=><li key={j}>{q.optionImages&&q.optionImages[j]&&<img src={q.optionImages[j]} alt={`Gambar opsi ${j+1}`} className="max-h-20 max-w-full object-contain mb-1"/>}{o}</li>)}</ol>}<details className="mt-3 text-sm"><summary className="cursor-pointer font-semibold">Kunci, pembahasan, dan catatan validasi</summary><p className="mt-2"><b>Kunci:</b> {Array.isArray(q.correct)?q.correct.join('; '):q.correct}</p><p className="mt-2"><b>Pembahasan:</b> {q.explanation}</p>{issues.length>0&&<ul className="list-disc ml-5 mt-2 text-orange-700">{issues.map((x,j)=><li key={j}>{x}</li>)}</ul>}</details></div>)}</div>}</div><div className="p-5 border-t bg-gray-50 flex justify-end gap-3 sticky bottom-0"><button onClick={onCancel} className="px-5 py-2 rounded-lg font-bold text-gray-600">Batal</button><button disabled={busy} onClick={generate} className="px-6 py-2 rounded-lg bg-indigo-600 text-white font-bold">{busy?'Memproses...':'Buat Soal'}</button><button disabled={!preview.length||busy} onClick={accept} className="px-6 py-2 rounded-lg bg-green-600 text-white font-bold">Tambahkan ke Editor</button></div></div></div>;
+            return <div className="fixed inset-0 z-[70] bg-black bg-opacity-50 flex items-center justify-center p-4 fade-in"><div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] overflow-y-auto"><div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white z-10"><div><h3 className="text-xl font-extrabold text-gray-800">🤖 Generator Soal TKA SD</h3><p className="text-xs text-gray-500 mt-1">AI Gemini dengan API key milik sekolah. Jika model utama sedang padat/gagal, sistem otomatis beralih ke model Gemini Flash cadangan. Gambar yang diperlukan dibuat otomatis oleh AI, lalu diperiksa oleh validator lokal dan generator cadangan.</p></div><button onClick={onCancel}><X size={24}/></button></div><div className="p-6 space-y-5"><div className="grid md:grid-cols-3 gap-4"><div><label className="block text-sm font-bold mb-1">Mata Uji</label><select value={subject} onChange={e=>{const nextSubject=e.target.value;const nextElement=nextSubject==='Matematika'?'Bilangan':'Keterampilan Membaca';const nextCompetency=nextSubject==='Matematika'?'Pemecahan masalah matematis':'Pemahaman Tekstual';setSubject(nextSubject);setElement(nextElement);setCompetency(nextCompetency);const nextSub=nextSubject==='Matematika'?(TKA_META.mathSubelements[nextElement]||[])[0]||'':(TKA_META.biSubcompetencies[nextCompetency]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection(nextSubject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg"><option>Matematika</option><option>Bahasa Indonesia</option></select></div><div><label className="block text-sm font-bold mb-1">Elemen</label>{subject==='Matematika'?<select value={element} onChange={e=>{const nextElement=e.target.value;setElement(nextElement);const nextSub=(TKA_META.mathSubelements[nextElement]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection((TKA_META.mathCoverage[nextSub]||[])[0]||'')}} className="w-full p-3 border rounded-lg">{TKA_META.mathElements.map(x=><option key={x}>{x}</option>)}</select>:<input readOnly value="Keterampilan Membaca" className="w-full p-3 border rounded-lg bg-gray-50"/>}</div><div><label className="block text-sm font-bold mb-1">Level Kognitif</label><select value={level} onChange={e=>{setLevel(e.target.value);setThinkingProcess(TKA_META.cognitive[e.target.value][0])}} className="w-full p-3 border rounded-lg">{Object.keys(TKA_META.cognitive).map(x=><option key={x}>{x}</option>)}</select></div><div><label className="block text-sm font-bold mb-1">Kompetensi</label><select value={competency} onChange={e=>{setCompetency(e.target.value);const next=subject==='Bahasa Indonesia'?(TKA_META.biSubcompetencies[e.target.value]||[]):(TKA_META.mathSubelements[element]||[]);const nextSub=next[0]||'';setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{(subject==='Matematika'?['Pengetahuan matematika','Representasi matematis','Penalaran','Pemecahan masalah matematis','Koneksi matematis']:TKA_META.biCompetencies).map(x=><option key={x}>{x}</option>)}</select></div><div className="md:col-span-3"><label className="block text-sm font-bold mb-1">{subject==='Bahasa Indonesia'?'Subkompetensi':'Sub-elemen / Submateri'}</label><select value={subSelection} onChange={e=>{const nextSub=e.target.value;setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{availableSubSelections.map(x=><option key={x}>{x}</option>)}{availableSubSelections.length===0&&<option value="">Tidak tersedia</option>}</select><p className="text-xs text-gray-500 mt-1">Pilihan mengikuti kompetensi/elemen yang dipilih dan kerangka TKA SD.</p></div>{subject==='Matematika'&&<div className="md:col-span-3"><label className="block text-sm font-bold mb-1">Pilihan Cakupan Sub-elemen</label><select value={coverageSelection} onChange={e=>setCoverageSelection(e.target.value)} className="w-full p-3 border rounded-lg"><option value="">Semua cakupan pada sub-elemen</option>{availableCoverages.map(x=><option key={x} value={x}>{x}</option>)}</select><p className="text-xs text-gray-500 mt-1">Pilih cakupan sesuai tabel kerangka TKA SD. Cakupan ini menjadi dasar pembuatan dan analisis butir Matematika.</p></div>}<div className="md:col-span-3 border rounded-xl p-4 bg-gray-50"><label className="block text-sm font-bold mb-2">Bentuk Soal dan Jumlah Soal</label><p className="text-xs text-gray-500 mb-3">Pilih jumlah masing-masing bentuk soal. Semua bentuk dapat dibuat sekaligus pada kompetensi yang dipilih.</p><div className="grid md:grid-cols-3 gap-3"><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PG Sederhana</div><div className="text-xs text-gray-500 mb-2">1 jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.single} onChange={e=>setTypeCount('single',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK MCMA</div><div className="text-xs text-gray-500 mb-2">lebih dari satu jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.complex} onChange={e=>setTypeCount('complex',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK Kategori</div><div className="text-xs text-gray-500 mb-2">pernyataan benar/salah</div><input type="number" min="0" max="20" value={questionCounts.statement} onChange={e=>setTypeCount('statement',e.target.value)} className="w-full p-2 border rounded-lg"/></div></div><div className="mt-3 text-sm font-bold text-indigo-700">Total soal: {totalCount} / 20</div></div><div><label className="block text-sm font-bold mb-1">Kesulitan</label><select value={difficulty} onChange={e=>setDifficulty(e.target.value)} className="w-full p-3 border rounded-lg"><option>Mudah</option><option>Sedang</option><option>Sulit</option></select></div><div><label className="block text-sm font-bold mb-1">Jenis</label><select value={itemType} onChange={e=>setItemType(e.target.value)} className="w-full p-3 border rounded-lg"><option>Tunggal</option><option>Grup</option></select></div><div><label className="block text-sm font-bold mb-1">Sumber Generator</label><select value={mode} onChange={e=>setMode(e.target.value)} className="w-full p-3 border rounded-lg"><option value="ai">AI Gemini (API Key Sekolah)</option><option value="local">Lokal / Cadangan</option></select></div><div><label className="block text-sm font-bold mb-1">API Key AI</label><input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="API key Gemini sekolah" className="w-full p-3 border rounded-lg"/><label className="text-xs text-gray-500 flex items-center gap-2 mt-1"><input type="checkbox" checked={showKey} onChange={e=>setShowKey(e.target.checked)}/> Tampilkan key</label><p className="text-xs text-orange-700 mt-1">Jangan bagikan file HTML yang berisi key. Key hanya disimpan selama sesi browser.</p></div></div><div><label className="block text-sm font-bold mb-1">Topik atau konteks tambahan (opsional)</label><input value={topic} onChange={e=>setTopic(e.target.value)} placeholder="Contoh: lingkungan sekolah, pecahan, diagram batang" className="w-full p-3 border rounded-lg"/></div>{status&&<div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-sm text-blue-900">{status}</div>}{preview.length>0&&<div className="space-y-3"><div className="flex justify-between items-center"><h4 className="font-bold">Hasil AI</h4><button onClick={generate} disabled={busy} className="px-3 py-2 rounded-lg bg-amber-500 text-white font-bold">Regenerasi</button></div>{preview.map(({q,issues},i)=><div key={q.id} className="border rounded-xl p-4"><div className="flex justify-between gap-3"><b>Soal {i+1}</b>{issues.length?<span className="text-xs bg-orange-100 text-orange-800 px-2 py-1 rounded">{issues.length} masalah</span>:<span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">Lolos validasi dasar</span>}</div><p className="mt-2 text-sm whitespace-pre-wrap">{q.text}</p>{q.image&&<div className="mt-3 rounded-lg border bg-gray-50 p-2"><div className="text-xs font-semibold text-gray-500 mb-2">Gambar dibuat otomatis oleh AI</div><img src={q.image} alt={q.imageAlt||"Gambar pendukung soal"} className="max-w-full max-h-64 mx-auto object-contain" /></div>}{q.imageRequired&&!q.image&&<div className="mt-3 text-xs text-orange-700 bg-orange-50 border border-orange-200 rounded-lg p-2">AI menandai soal ini membutuhkan gambar, tetapi gambar belum berhasil dibuat. Silakan regenerasi.</div>}{q.options.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.options.map((o,j)=><li key={j}>{q.optionImages&&q.optionImages[j]&&<img src={q.optionImages[j]} alt={`Gambar opsi ${j+1}`} className="max-h-20 max-w-full object-contain mb-1"/>}{o}</li>)}</ol>}<details className="mt-3 text-sm"><summary className="cursor-pointer font-semibold">Kunci, pembahasan, dan catatan validasi</summary><p className="mt-2"><b>Kunci:</b> {Array.isArray(q.correct)?q.correct.join('; '):q.correct}</p><p className="mt-2"><b>Pembahasan:</b> {q.explanation}</p>{issues.length>0&&<ul className="list-disc ml-5 mt-2 text-orange-700">{issues.map((x,j)=><li key={j}>{x}</li>)}</ul>}</details></div>)}</div>}</div><div className="p-5 border-t bg-gray-50 flex justify-end gap-3 sticky bottom-0"><button onClick={onCancel} className="px-5 py-2 rounded-lg font-bold text-gray-600">Batal</button><button disabled={busy} onClick={generate} className="px-6 py-2 rounded-lg bg-indigo-600 text-white font-bold">{busy?'Memproses...':'Buat Soal'}</button><button disabled={!preview.length||busy} onClick={accept} className="px-6 py-2 rounded-lg bg-green-600 text-white font-bold">Tambahkan ke Editor</button></div></div></div>;
         };
 
 
@@ -1098,7 +1335,7 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                     : `⚠️ ${context} belum dapat diproses karena batas permintaan Gemini sedang tercapai. Silakan tunggu beberapa saat, lalu klik **Regenerasi Validasi** kembali. Soal yang sudah valid tetap dipertahankan.`;
             }
             if (lower.includes('high demand') || lower.includes('spikes in demand') || lower.includes('currently experiencing high demand')) {
-                return `⚠️ Layanan Gemini sedang mengalami permintaan tinggi. Ini biasanya sementara. Silakan tunggu beberapa saat dan klik **Regenerasi Validasi** kembali. Soal yang sudah valid tetap dipertahankan.`;
+                return `⚠️ Semua model Gemini yang tersedia untuk generator sedang sibuk atau tidak merespons. Silakan coba **Regenerasi** beberapa saat lagi. Soal yang sudah valid tetap dipertahankan.`;
             }
             if (lower.includes('503') || lower.includes('service unavailable') || lower.includes('temporarily unavailable')) {
                 return `⚠️ Layanan Gemini sementara tidak tersedia. Silakan tunggu beberapa saat kemudian dan klik **Regenerasi Validasi** kembali. Soal yang sudah valid tetap dipertahankan.`;
@@ -1141,15 +1378,58 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                         if(!apiKey.trim()) throw new Error('Masukkan API key AI terlebih dahulu.');
                         setTkaAiKey(apiKey.trim());
                         const prompt=`Anda adalah pengembang asesmen TKA SD Indonesia. Buat tepat ${totalCount} soal sebagai PAKET TRYOUT MENYELURUH untuk mata uji ${subject}. Blueprint per butir berikut adalah WAJIB diikuti: ${JSON.stringify(payload)}. Jangan mengubah jumlah atau urutan blueprint. Tryout harus mencakup seluruh elemen/sub-elemen kompetensi yang tercantum dan mendistribusikan cakupan secara seimbang sesuai blueprint. Setiap butir wajib memiliki metadata sesuai baris blueprint-nya. Untuk Matematika, cakupanSubelemen/coverage wajib diukur secara substantif; jangan hanya menyalin label. Untuk Bahasa Indonesia, gunakan bacaan yang relevan dengan kompetensi/subkompetensi dan hindari pertanyaan yang jawabannya sekadar menyalin satu kalimat. Variasikan konteks, angka, strategi, bentuk penalaran, dan pengecoh. PG sederhana tepat satu kunci; PGK MCMA minimal dua kunci; PGK kategori memiliki pernyataan benar/salah yang dapat dibuktikan. Untuk soal grup, gunakan stimulus bersama yang kaya dan soal saling terkait. Jika visual benar-benar diperlukan, buat SVG mandiri pada imageSvg. Jangan gunakan URL gambar eksternal. Kembalikan HANYA JSON valid berupa array objek. Skema setiap objek: id,type,text,stimulus,options,correct,statements,explanation,subject,element,subelement,competency,subcompetency,cakupanSubelemen,coverage,cognitiveLevel,thinkingProcess,itemType,imageSvg,imageAlt,imageRequired,imageDescription,optionImageSvgs. Lakukan pemeriksaan internal atas kunci, angka, konsistensi stimulus, level kognitif, duplikasi opsi, dan kesesuaian blueprint.`;
-                        const aiUrl='https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key='+encodeURIComponent(apiKey.trim());
-                        const aiBody={contents:[{parts:[{text:prompt}]}],generationConfig:{temperature:0.65,responseMimeType:'application/json'}};
-                        let response=null,data=null,last=null;
-                        for(let attempt=1;attempt<=3;attempt++){
-                            try{ if(attempt>1){setStatus(`Layanan AI padat. Mencoba kembali (${attempt}/3)...`);await new Promise(r=>setTimeout(r,1800*Math.pow(2,attempt-2)));} response=await fetch(aiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiBody)});data=await response.json().catch(()=>({}));if(response.ok)break;last=new Error(data.error?.message||`HTTP ${response.status}`);if(![408,425,429,500,502,503,504].includes(response.status))throw last;}catch(e){last=e;if(attempt===3)throw e;}}
-                        if(!response?.ok)throw(last||new Error('Layanan AI tidak merespons.'));
-                        const txt=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';if(!txt.trim())throw new Error('AI tidak mengembalikan soal.');
-                        let parsed;try{parsed=JSON.parse(txt.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim());}catch(e){throw new Error('Format JSON AI tidak valid. Silakan regenerasi.');}
-                        raw=Array.isArray(parsed)?parsed:(parsed.questions||[]);if(!raw.length)throw new Error('AI tidak menghasilkan daftar soal.');
+                        // Fallback model otomatis untuk GENERATOR TRYOUT TKA.
+                        // Urutan: model utama -> Flash -> Flash-Lite.
+                        const aiModels = [
+                            'gemini-3.6-flash',
+                            'gemini-3.5-flash',
+                            'gemini-3.5-flash-lite',
+                            'gemini-3.1-flash-lite'
+                        ];
+                        const aiBody={contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json'}};
+                        let response=null,data=null,lastAiError=null,usedModel='',parsed=null;
+                        const isRetryableAiFailure=(status,msg='')=>{
+                            const s=String(status||'').toLowerCase();
+                            const m=String(msg||'').toLowerCase();
+                            return [408,425,429,500,502,503,504].includes(Number(status)) ||
+                                /high demand|spikes in demand|currently experiencing high demand|quota exceeded|rate limit|too many requests|temporarily unavailable|service unavailable/.test(m) ||
+                                /\b408\b|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b/.test(s);
+                        };
+
+                        for(let modelIndex=0;modelIndex<aiModels.length && !raw.length;modelIndex++){
+                            const model=aiModels[modelIndex];
+                            const aiUrl=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+                            for(let attempt=1;attempt<=2 && !raw.length;attempt++){
+                                try{
+                                    if(modelIndex>0){
+                                        setStatus(`Model ${aiModels[modelIndex-1]} sedang padat/gagal. Beralih otomatis ke ${model} (${modelIndex+1}/${aiModels.length})...`);
+                                    }else if(attempt>1){
+                                        setStatus(`Model ${model} sedang padat. Mencoba kembali (${attempt}/2)...`);
+                                    }
+                                    if(attempt>1) await new Promise(r=>setTimeout(r,1800*Math.pow(2,attempt-2)));
+                                    response=await fetch(aiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiBody)});
+                                    data=await response.json().catch(()=>({}));
+                                    if(!response.ok){
+                                        const msg=data.error?.message||`Layanan AI gagal (HTTP ${response.status}).`;
+                                        lastAiError=new Error(msg);
+                                        if(!isRetryableAiFailure(response.status,msg)) throw lastAiError;
+                                        continue;
+                                    }
+                                    const txt=data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
+                                    if(!txt.trim()){lastAiError=new Error(`Model ${model} tidak mengembalikan soal.`);continue;}
+                                    const cleaned=txt.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'').trim();
+                                    try{parsed=JSON.parse(cleaned);}catch(e){lastAiError=new Error(`Model ${model} mengembalikan JSON tidak valid.`);continue;}
+                                    const candidateRaw=Array.isArray(parsed)?parsed:(Array.isArray(parsed.questions)?parsed.questions:[]);
+                                    if(!candidateRaw.length){lastAiError=new Error(`Model ${model} tidak menghasilkan daftar soal.`);continue;}
+                                    raw=candidateRaw;usedModel=model;
+                                }catch(e){
+                                    lastAiError=e;
+                                    if(!isRetryableAiFailure(e?.status,e?.message)) throw e;
+                                }
+                            }
+                        }
+                        if(!raw.length) throw(lastAiError||new Error('Semua model AI TRYOUT gagal merespons.'));
+                        if(usedModel && usedModel!==aiModels[0]) setStatus(`TRYOUT berhasil dibuat menggunakan fallback ${usedModel}.`);
                     }
                     const normalized=raw.slice(0,totalCount).map((q,i)=>normalizeAIQuestion({...q,...blueprint[i],subelement:blueprint[i].subelement||q.subelement||'',subcompetency:blueprint[i].subcompetency||q.subcompetency||'',cakupanSubelemen:blueprint[i].coverage||q.cakupanSubelemen||q.coverage||'',coverage:blueprint[i].coverage||q.coverage||q.cakupanSubelemen||''},i));
                     const checked=normalized.map((q,i)=>({q:repairQuestionForValidation(q),issues:validateAIQuestion(q),index:i,blueprint:blueprint[i]}));
@@ -1554,19 +1834,20 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
 
             const getQuestionValidation = (items) => items.flatMap((q, i) => validateTKAQuestion(q).map(msg => `Soal ${i+1}: ${msg}`));
 
-            const handleDeleteResults = async () => {
-                if (!results.length) {
-                    alert("Belum ada Rekap Nilai yang dapat dihapus.");
+            const handleDeleteResults = async (examResults, examTitle = "Tanpa Nama Ujian") => {
+                const group = Array.isArray(examResults) ? examResults : [];
+                if (!group.length) {
+                    alert(`Belum ada Rekap Nilai untuk ujian "${examTitle}" yang dapat dihapus.`);
                     return;
                 }
                 const confirmed = window.confirm(
-                    `Hapus seluruh Rekap Nilai yang masuk untuk akun guru ini?\n\nJumlah data: ${results.length} siswa.\n\nData yang dihapus tidak dapat dipulihkan.`
+                    `Hapus Rekap Nilai hanya untuk ujian "${examTitle}"?\n\nJumlah data: ${group.length} siswa.\n\nData ujian lain tidak akan ikut terhapus.\nData yang dihapus tidak dapat dipulihkan.`
                 );
                 if (!confirmed) return;
                 try {
-                    await Promise.all(results.map((item) => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', item.id))));
-                    setResults([]);
-                    alert("Rekap Nilai berhasil dihapus.");
+                    await Promise.all(group.map((item) => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', item.id))));
+                    setResults(prev => prev.filter(item => !group.some(g => g.id === item.id)));
+                    alert(`Rekap Nilai untuk ujian "${examTitle}" berhasil dihapus.`);
                 } catch (e) {
                     console.error("Delete Results Error:", e);
                     alert("Gagal menghapus Rekap Nilai: " + e.message);
@@ -1830,6 +2111,9 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                                                                                 <button onClick={() => downloadWordQuestions(titleQuestions, title)} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-purple-100 text-purple-700 hover:bg-purple-200 normal-case font-bold" title={`Unduh Word ${title}`}>
                                                                                     <FileText size={14}/> Word + Kisi-Kisi
                                                                                 </button>
+                                                                                <button onClick={() => downloadPdfQuestions(titleQuestions, title)} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-red-100 text-red-700 hover:bg-red-200 normal-case font-bold" title={`Unduh PDF ${title}`}>
+                                                                                    <Download size={14}/> PDF
+                                                                                </button>
                                                                             </div>
                                                                         </div>
                                                                         {titleQuestions.map(q => {
@@ -1861,21 +2145,8 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
             <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
                 <BarChart3 size={24}/> Rekap Nilai per Mata Pelajaran/Ujian
             </h2>
-            <div className="flex flex-wrap gap-2">
-                <button 
-                    onClick={() => downloadExcel(results, "Semua_Nilai")}
-                    className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition"
-                >
-                    <Download size={18}/> Download Semua Excel
-                </button>
-                <button onClick={() => downloadAnalysis(results, "Semua_Ujian")} disabled={results.length === 0} className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition ${results.length === 0 ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}><BarChart3 size={18}/> Unduh Analisis Soal</button>
-                <button 
-                    onClick={handleDeleteResults}
-                    disabled={results.length === 0}
-                    className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition ${results.length === 0 ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700 text-white'}`}
-                >
-                    <Trash2 size={18}/> Hapus Rekap Nilai
-                </button>
+            <div className="text-sm text-gray-500">
+                Setiap tindakan dilakukan khusus pada <b>Judul Ujian</b> masing-masing.
             </div>
         </div>
 
@@ -1903,18 +2174,26 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                                     {group.length} Siswa
                                 </span>
                             </h3>
-                            <button
-                                onClick={() => downloadAnalysis(group, examTitle)}
-                                className="bg-white text-indigo-700 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1"
-                            >
-                                <BarChart3 size={14}/> Analisis Soal
-                            </button>
-                            <button 
-                                onClick={() => downloadExcel(group, examTitle)}
-                                className="bg-white text-indigo-700 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1"
-                            >
-                                <Download size={14}/> Download Excel {examTitle}
-                            </button>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                                <button
+                                    onClick={() => downloadAnalysis(group, examTitle)}
+                                    className="bg-white text-indigo-700 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                                >
+                                    <BarChart3 size={14}/> Analisis Soal
+                                </button>
+                                <button 
+                                    onClick={() => downloadExcel(group, examTitle)}
+                                    className="bg-white text-indigo-700 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                                >
+                                    <Download size={14}/> Download Excel
+                                </button>
+                                <button 
+                                    onClick={() => handleDeleteResults(group, examTitle)}
+                                    className="bg-red-500 text-white hover:bg-red-600 px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1"
+                                >
+                                    <Trash2 size={14}/> Hapus Rekap Nilai
+                                </button>
+                            </div>
                         </div>
 
                         <div className="overflow-x-auto">
