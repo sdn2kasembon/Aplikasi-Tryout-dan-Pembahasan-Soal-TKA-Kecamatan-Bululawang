@@ -202,9 +202,10 @@
 
         // Fungsi Helper untuk Menentukan Kategori Nilai
         const getScoreCategory = (score) => {
-            if (score >= 95) return "Istimewa";
-            if (score >= 75) return "Baik";
-            if (score >= 55) return "Memadai";
+            const nilai = Number(score) || 0;
+            if (nilai >= 95) return "Istimewa";
+            if (nilai >= 76.67) return "Baik";
+            if (nilai >= 50) return "Memadai";
             return "Kurang";
         };
         
