@@ -68,11 +68,12 @@
             addDoc, 
             deleteDoc,
             query,
-            getDocs
+            getDocs,
+            runTransaction
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
          // --- KONFIGURASI FIREBASE ---
-        const defaultFirebaseConfig = {
+       const defaultFirebaseConfig = {
             apiKey: "AIzaSyDD6jSOdxAXjANARLyd7KI3KjtnMcn61gA",
             authDomain: "aplikasi-tka-2027.firebaseapp.com",
             projectId: "aplikasi-tka-2027",
@@ -84,8 +85,21 @@
 
 
 
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : defaultFirebaseConfig; 
-        
+
+        const firebaseConfig = (() => {
+            try {
+                return typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : defaultFirebaseConfig;
+            } catch (e) {
+                console.error('Konfigurasi Firebase tidak valid; memakai konfigurasi default yang tersedia.', e);
+                return defaultFirebaseConfig;
+            }
+        })();
+        const firebaseConfigReady = Boolean(
+            firebaseConfig?.apiKey && firebaseConfig.apiKey !== 'apiKey' &&
+            firebaseConfig?.authDomain && firebaseConfig.authDomain !== 'auttDomain' &&
+            firebaseConfig?.projectId
+        );
+
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
@@ -204,6 +218,132 @@
                 return cleaned;
             }
             return value;
+        };
+
+        // Batas dokumen Firestore sekitar 1 MiB. Sisakan ruang aman untuk metadata.
+        const estimateFirestoreBytes = (value) => {
+            try {
+                const json = JSON.stringify(sanitizeFirestoreData(value));
+                return new TextEncoder().encode(json).length;
+            } catch (e) {
+                return Number.POSITIVE_INFINITY;
+            }
+        };
+        // Batas internal 950 KiB (di bawah batas keras Firestore 1 MiB), memberi ruang untuk overhead dokumen.
+        const FIRESTORE_SAFE_DOCUMENT_BYTES = 950 * 1024;
+
+        // Unggah gambar data-URL ke kompresi gambar lokal; dokumen Firestore hanya menyimpan URL.
+        // Paket ini mempertahankan paket Firebase saat ini: tidak memakai kompresi gambar lokal.
+        // Gambar data-URL dikompresi di browser sebelum disimpan sebagai bagian dokumen Firestore.
+        const externalizeExamImages = async (value, ownerUid, scopeKey, onProgress = () => {}) => {
+            const imageMap = new Map();
+            const collect = (node) => {
+                if (typeof node === 'string') {
+                    if (/^data:image\//i.test(node) && !imageMap.has(node)) imageMap.set(node, true);
+                    return;
+                }
+                if (Array.isArray(node)) { node.forEach(collect); return; }
+                if (node && typeof node === 'object') Object.values(node).forEach(collect);
+            };
+            collect(value);
+
+            const entries = [...imageMap.keys()];
+            const compressed = new Map();
+            let completed = 0;
+            let cursor = 0;
+
+            const byteLengthFromDataUrl = (dataUrl) => {
+                const comma = dataUrl.indexOf(',');
+                if (comma < 0) return dataUrl.length;
+                const header = dataUrl.slice(0, comma);
+                const body = dataUrl.slice(comma + 1);
+                if (/;base64/i.test(header)) return Math.floor(body.length * 3 / 4) - (body.endsWith('==') ? 2 : body.endsWith('=') ? 1 : 0);
+                try { return new TextEncoder().encode(decodeURIComponent(body)).length; }
+                catch (_) { return body.length; }
+            };
+
+            const loadImage = (dataUrl) => new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => resolve(image);
+                image.onerror = () => reject(new Error('Salah satu gambar tidak dapat dibaca untuk dikompresi. Periksa file gambar pada soal.'));
+                image.src = dataUrl;
+            });
+
+            const compressOne = async (dataUrl) => {
+                // SVG dipertahankan agar diagram vektor dan teks kecil tidak berubah.
+                if (/^data:image\/svg\+xml/i.test(dataUrl)) return dataUrl;
+                const originalBytes = byteLengthFromDataUrl(dataUrl);
+                // Gambar kecil tidak perlu diproses ulang.
+                if (originalBytes < 18 * 1024) return dataUrl;
+
+                const image = await loadImage(dataUrl);
+                const maxSide = 1600;
+                const scale = Math.min(1, maxSide / Math.max(image.naturalWidth || image.width, image.naturalHeight || image.height));
+                const width = Math.max(1, Math.round((image.naturalWidth || image.width) * scale));
+                const height = Math.max(1, Math.round((image.naturalHeight || image.height) * scale));
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d', { alpha: true });
+                if (!ctx) return dataUrl;
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(image, 0, 0, width, height);
+
+                const toWebP = (quality) => new Promise(resolve => {
+                    canvas.toBlob(blob => resolve(blob), 'image/webp', quality);
+                });
+                // Kualitas cukup tinggi untuk menjaga keterbacaan grafik/ilustrasi.
+                let blob = await toWebP(0.90);
+                if (!blob) return dataUrl;
+                if (blob.size > originalBytes * 0.94) {
+                    const secondTry = await toWebP(0.84);
+                    if (secondTry && secondTry.size < blob.size) blob = secondTry;
+                }
+                if (blob.size >= originalBytes) return dataUrl;
+
+                const buffer = await blob.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                let binary = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+                }
+                return `data:image/webp;base64,${btoa(binary)}`;
+            };
+
+            const worker = async () => {
+                while (true) {
+                    const index = cursor++;
+                    if (index >= entries.length) return;
+                    const dataUrl = entries[index];
+                    try {
+                        compressed.set(dataUrl, await compressOne(dataUrl));
+                    } catch (error) {
+                        console.warn('Gambar dipertahankan tanpa kompresi:', error);
+                        compressed.set(dataUrl, dataUrl);
+                    }
+                    completed++;
+                    onProgress({ completed, total: entries.length });
+                }
+            };
+
+            if (entries.length) {
+                onProgress({ completed: 0, total: entries.length });
+                await Promise.all(Array.from({ length: Math.min(2, entries.length) }, worker));
+            }
+
+            const rebuild = (node) => {
+                if (typeof node === 'string') return compressed.get(node) || node;
+                if (Array.isArray(node)) return node.map(rebuild);
+                if (node && typeof node === 'object') {
+                    const result = {};
+                    for (const [key, child] of Object.entries(node)) result[key] = rebuild(child);
+                    return result;
+                }
+                return node;
+            };
+            return rebuild(value);
         };
 
         // Normalisasi notasi matematika: mendukung LaTeX mentah dari generator/soal lama.
@@ -1406,7 +1546,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
             return source.flatMap(item => Array.isArray(item) ? item : [item])
                 .map(optionText)
                 .map(v => v.replace(/^\s*(?:[A-H]|[0-9]+)\s*[.)\-:]\s*/i, '').trim())
-                .filter(v => v && !/^\d+$/.test(v));
+                .filter(v => v && !/^\d+$/.test(v) && !/^[A-H]$/i.test(v));
         };
         const getRawOptionList = (q) => {
             const candidates = [q?.options, q?.choices, q?.answers, q?.optionTexts, q?.answerOptions, q?.choiceTexts, q?.answerChoices, q?.alternatives];
@@ -1420,6 +1560,21 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
 
         const normalizeAIQuestion = (q, index = 0) => {
             const type = ['single','complex','statement'].includes(q.type) ? q.type : 'single';
+            const rawOptionSource = [q?.options, q?.choices, q?.answers, q?.optionTexts, q?.answerOptions, q?.choiceTexts, q?.answerChoices, q?.alternatives]
+                .find(v => v !== undefined && v !== null);
+            let rawOptionProbe = rawOptionSource;
+            if (typeof rawOptionProbe === 'string') {
+                try { const parsedProbe = JSON.parse(rawOptionProbe); if (Array.isArray(parsedProbe) || (parsedProbe && typeof parsedProbe === 'object')) rawOptionProbe = parsedProbe; } catch(e) {}
+            }
+            if (rawOptionProbe && !Array.isArray(rawOptionProbe) && typeof rawOptionProbe === 'object') {
+                rawOptionProbe = Object.keys(rawOptionProbe).sort((a,b) => Number(a)-Number(b)).map(k => rawOptionProbe[k]);
+            }
+            const rawOptionValues = Array.isArray(rawOptionProbe)
+                ? rawOptionProbe.flatMap(item => Array.isArray(item) ? item : [item]).map(optionText).map(v => v.trim()).filter(Boolean)
+                : [];
+            const generatorOptionIssues = rawOptionValues.some(v => /^[A-H][.)-]?$/i.test(String(v).trim()))
+                ? ['Generator menghasilkan opsi yang hanya berupa label huruf (misalnya A/B/C), bukan isi jawaban. Butir harus dibuat ulang; opsi tidak boleh hanya berupa huruf.']
+                : [];
             const options = getRawOptionList(q);
             const correct = Array.isArray(q.correct) ? q.correct.map(optionText).filter(Boolean) : optionText(q.correct);
             let statements = Array.isArray(q.statements) ? q.statements.map((x,i)=>({id:x.id || makeId()+i, text:optionText(x.text ?? x.statement ?? x.label), correct:Boolean(x.correct)})).filter(x=>x.text) : [];
@@ -1441,7 +1596,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
                 subject:q.subject||'Matematika', element:q.element||'Bilangan', subelement:q.subelement||'', cakupanSubelemen:q.cakupanSubelemen||q.coverage||'', coverage:q.coverage||q.cakupanSubelemen||'',
                 competency:q.competency||'', subcompetency:q.subcompetency||'', cognitiveLevel:q.cognitiveLevel||'Aplikasi',
                 thinkingProcess:q.thinkingProcess||'', itemType:q.itemType||'Tunggal', questionForm:q.questionForm||TKA_META.forms[type],
-                explanation:String(q.explanation||'Pembahasan belum tersedia.'), similarityScore:Number.isFinite(Number(q.similarityScore))?Number(q.similarityScore):0, diversityStatus:String(q.diversityStatus||'PENDING'), variationProfile:q.variationProfile&&typeof q.variationProfile==='object'?q.variationProfile:{}, aiGenerated:true
+                explanation:String(q.explanation||'Pembahasan belum tersedia.'), similarityScore:Number.isFinite(Number(q.similarityScore))?Number(q.similarityScore):0, diversityStatus:String(q.diversityStatus||'PENDING'), variationProfile:q.variationProfile&&typeof q.variationProfile==='object'?q.variationProfile:{}, generatorOptionIssues, aiGenerated:true
             };
         };
 
@@ -1661,7 +1816,8 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
             if (q.type === 'single') {
                 q.options = getRawOptionList(q).map(clean).filter(Boolean);
                 const correct = clean(q.correct);
-                if (correct && !q.options.includes(correct)) q.options.unshift(correct);
+                const usableCorrect = /^[A-H]$/i.test(correct) ? '' : correct;
+                if (usableCorrect && !q.options.includes(usableCorrect)) q.options.unshift(usableCorrect);
                 const fillers = q.subject === 'Bahasa Indonesia'
                     ? ['Informasi tersebut tidak dibahas dalam teks.','Pilihan tersebut bertentangan dengan informasi dalam teks.','Pilihan tersebut tidak dapat disimpulkan dari teks.','Pilihan tersebut tidak berkaitan dengan peristiwa dalam teks.']
                     : ['Informasi pada soal tidak mendukung pilihan tersebut.','Hasil tersebut tidak sesuai dengan data pada soal.','Pilihan tersebut tidak memenuhi kondisi yang diberikan.','Pilihan tersebut merupakan hasil perhitungan yang keliru.'];
@@ -1671,7 +1827,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
                 for (const f of fillers) if (q.options.length < 4 && !q.options.includes(f)) q.options.push(f);
                 q.options = q.options.slice(0,4);
                 if (!q.options.length) q.options = fillers.slice(0,4);
-                q.correct = clean(q.correct);
+                q.correct = usableCorrect;
                 if (!q.correct || !q.options.includes(q.correct)) q.correct = q.options[0];
                 if (!q.explanation || q.explanation === 'Pembahasan belum tersedia.') q.explanation = `Kunci jawaban adalah "${q.correct}" karena paling sesuai dengan informasi dan kondisi yang diberikan pada soal.`;
             } else if (q.type === 'complex') {
@@ -1772,6 +1928,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
 
         const validateAIQuestion = (q) => {
             const issues = [...validateTKAQuestion(q)];
+            if (Array.isArray(q.generatorOptionIssues)) issues.push(...q.generatorOptionIssues);
             // Telaah substantif lokal: tidak cukup hanya memeriksa struktur JSON.
             // Pemeriksaan ini mencari indikasi soal ambigu, kunci tidak didukung,
             // pengecoh lemah, tuntutan kognitif tidak selaras, dan bahasa yang berisiko.
@@ -1818,6 +1975,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
                 if (q.cognitiveLevel === 'Aplikasi' && /^(hitung|berapa hasil|tentukan hasil)/i.test(stem) && !/(situasi|konteks|jika|kemudian|setelah|dibandingkan)/i.test(stem)) issues.push('Level Aplikasi berpotensi masih berupa latihan prosedural; tambahkan konteks/permasalahan yang membutuhkan penerapan.');
             }
             if (Array.isArray(q.options) && q.options.length) {
+                if (q.options.some(o => /^[A-H]$/i.test(text(o)))) issues.push('Ada opsi jawaban yang hanya berupa huruf/label (misalnya A atau B). Isi setiap opsi dengan teks jawaban yang lengkap dan bermakna.');
                 const norm = q.options.map(text).map(x => x.toLowerCase());
                 const tooSimilar = [];
                 for (let i=0;i<norm.length;i++) for(let j=i+1;j<norm.length;j++){
@@ -1855,7 +2013,7 @@ ATURAN WAJIB KERANGKA TKA SD/MI (Perkaban BSKAP No. 047/H/AN/2025):
 
         };
 
-        // Telaah ahli berbasis AI: dipakai setelah validator lokal. Hasil AI tidak
+        // Telaah ahli berbasis AI: dipakai setelah validator lokal. Hasil AI — setiap opsi harus berupa isi jawaban, bukan label huruf tidak
         // boleh menghapus temuan lokal; hanya dapat menambah temuan substantif.
         const validateQuestionWithAI = async (q, index, suppliedApiKey = '') => {
             let apiKey = String(suppliedApiKey || '').trim() || getTkaAiKey();
@@ -1992,7 +2150,7 @@ Kembalikan HANYA satu objek JSON lengkap dengan field id,type,text,stimulus,opti
             const generate = async () => {
                 if(totalCount<1) { alert('Pilih minimal 1 soal.'); return; }
                 if(totalCount>20) { alert('Jumlah total soal maksimal 20.'); return; }
-                setBusy(true); setStatus('Menyiapkan blueprint dan meminta soal AI...');
+                setBusy(true); setStatus('Menyiapkan blueprint dan meminta AI membuat soal dalam satu proses...');
                 const questionDistribution={single:questionCounts.single,complex:questionCounts.complex,statement:questionCounts.statement};
                 const payload={subject,element,competency,cognitiveLevel:level,thinkingProcess,itemType,difficulty,totalCount,questionDistribution,topic,subelement:subject==='Matematika'?subSelection:'',subcompetency:subject==='Bahasa Indonesia'?subSelection:'',cakupanSubelemen:subject==='Matematika'?(coverageSelection||'Semua cakupan pada sub-elemen'):'',regenerateSeed:String(Date.now())};
                 try {
@@ -2011,6 +2169,8 @@ Kembalikan HANYA satu objek JSON lengkap dengan field id,type,text,stimulus,opti
                         const prompt = `Anda adalah pengembang asesmen TKA SD/MI yang sangat berpengalaman. ${TKA_SD_AI_INSTRUCTIONS} Buat tepat ${totalCount} soal berkualitas tinggi berdasarkan blueprint berikut: ${JSON.stringify(payload)}. DISTRIBUSI BENTUK SOAL WAJIB: PG Sederhana=${questionCounts.single}, PGK MCMA=${questionCounts.complex}, PGK Kategori=${questionCounts.statement}. Jangan mengubah jumlah tiap bentuk. Gunakan kerangka TKA SD yang berlaku: Bahasa Indonesia berfokus pada keterampilan membaca melalui teks informasi/fiksi; kompetensinya pemahaman tekstual, pemahaman inferensial, serta evaluasi dan apresiasi. Matematika mencakup Bilangan, Geometri dan Pengukuran, serta Data dengan kompetensi pengetahuan matematika, representasi matematis, penalaran, pemecahan masalah, dan koneksi matematis. Soal harus menekankan penerapan, penalaran, dan pemecahan masalah, bukan latihan hitung rutin.
 
 ATURAN MUTU WAJIB: 1) Setiap soal harus memiliki tujuan ukur yang jelas dan benar-benar sesuai level kognitif yang diminta. 2) Hindari soal hafalan langsung, angka terlalu sederhana, kalimat generik, dan pola soal yang sama berulang. 3) Untuk Matematika, utamakan stimulus/konteks yang realistis dan minimal 2 langkah berpikir untuk Aplikasi/Penalaran; data harus cukup untuk menyelesaikan masalah dan semua opsi harus masuk akal sebagai pengecoh yang berasal dari kesalahan umum, bukan opsi asal. 4) Untuk Penalaran, minta siswa membandingkan, menghubungkan informasi, memilih strategi, menafsirkan hasil, atau mengevaluasi pernyataan. 5) Untuk Bahasa Indonesia, gunakan stimulus 150–200 kata untuk soal grup/tunggal yang berbasis bacaan; pertanyaan harus dapat dijawab dari teks tetapi tidak sekadar menyalin kalimat. Variasikan pertanyaan tentang informasi tersurat, inferensi, ide pokok/gagasan pendukung, kosakata dalam konteks, hubungan sebab-akibat, kesesuaian informasi, dan evaluasi/relevansi. 6) Jika itemType=Grup, buat satu stimulus yang cukup kaya untuk 3 soal yang berbeda dan saling terkait, bukan tiga pertanyaan yang identik. 7) Hindari petunjuk jawaban dari panjang opsi, kata yang berulang secara mencolok, atau pilihan yang jelas salah. 8) Pastikan hanya ada satu jawaban benar untuk single; MCMA memiliki sedikitnya dua jawaban benar; kategori memiliki kombinasi benar/salah yang dapat dibuktikan. 9) explanation harus menjelaskan langkah penalaran, bukan hanya menyebut kunci. 10) Jika soal membutuhkan diagram, tabel, bangun, denah, posisi, pecahan bergambar, atau visualisasi ruang, imageRequired=true dan WAJIB membuat SVG mandiri pada imageSvg. Gambar harus benar-benar diperlukan untuk menyelesaikan soal, memiliki label/angka yang konsisten dengan stimulus, dan tidak dekoratif. 11) Jangan menggunakan URL gambar eksternal. 12) Jangan mengklaim soal sebagai soal resmi pemerintah. 13) KHUSUS MATEMATIKA: jika cakupanSubelemen bukan "Semua cakupan pada sub-elemen", setiap butir wajib mengukur cakupan yang dipilih secara substantif. Jangan hanya menyalin label cakupan. Jika semua cakupan dipilih, distribusikan butir pada cakupan yang tersedia secara wajar.
+
+ATURAN OPSI JAWABAN SANGAT PENTING: Jangan pernah mengisi options dengan label huruf saja seperti "A", "B", "C", atau "D". Setiap opsi wajib berisi kalimat/frasa jawaban yang lengkap, spesifik, relevan dengan pertanyaan, dan dapat dipahami murid tanpa melihat label A/B/C/D. Label A., B., C., D. hanya ditambahkan oleh tampilan aplikasi, bukan menjadi isi options. Jangan mengembalikan angka indeks atau huruf sebagai isi opsi maupun sebagai nilai correct. Nilai correct untuk PG sederhana harus sama persis dengan teks salah satu opsi; untuk PGK MCMA berupa array teks opsi yang benar. Jika tidak mampu membuat empat opsi yang bermakna, tulis ulang butir tersebut sebelum mengembalikan JSON.
 
 SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,statements,explanation,subject,element,subelement,competency,subcompetency,cakupanSubelemen,coverage,cognitiveLevel,thinkingProcess,itemType,imageSvg,imageAlt,imageRequired,imageDescription,optionImageSvgs. Untuk single tepat 4 opsi dan correct berupa teks opsi. Untuk complex minimal 3 opsi dan correct berupa array teks opsi benar. Untuk statement statements berisi objek text dan correct boolean. Kembalikan hanya JSON valid tanpa markdown. Sebelum mengembalikan, lakukan pemeriksaan internal: hitung ulang semua angka, cek kunci terhadap opsi/pernyataan, cek konsistensi stimulus-gambar, cek level kognitif, cek tidak ada opsi duplikat, dan cek bahwa soal tidak dangkal.`;
                         // Fallback model otomatis khusus GENERATOR SOAL TKA (bukan TRYOUT).
@@ -2106,10 +2266,34 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                          }
                     }
                     const normalized=raw.map((q,i)=>normalizeAIQuestion({...q, subelement:subject==='Matematika'?subSelection:'', subcompetency:subject==='Bahasa Indonesia'?subSelection:'', cakupanSubelemen:subject==='Matematika'?(q.cakupanSubelemen||q.coverage||coverageSelection||'Semua cakupan pada sub-elemen'):'', coverage:subject==='Matematika'?(q.coverage||q.cakupanSubelemen||coverageSelection||'Semua cakupan pada sub-elemen'):''},i));
-                    const prepared=mode==='ai' ? await preflightGeneratedQuestions(normalized,apiKey,(cur,total,msg)=>setStatus(`${msg}: soal ${cur} dari ${total}...`)) : normalized.map(q=>repairQuestionForValidation(q));
-                    const checked=prepared.map((q,i)=>{const issues=[...new Set([...(Array.isArray(q.generatorValidation?.issues)?q.generatorValidation.issues:[]),...validateAIQuestion(q)])]; const aiChecked=!!q.generatorValidation?.aiChecked; const status=issues.length?'GAGAL VALIDASI':(aiChecked?'LULUS VALIDASI':'BELUM DITELAAH AI'); return {q:{...q,generatorValidation:{...(q.generatorValidation||{}),status:status.toLowerCase().replace(/ /g,'_'),issues,aiChecked,aiStatus:aiChecked?'DITELAAH AI':'BELUM DITELAAH AI'}},issues,index:i,status};});
+                    // PERCEPAT GENERATOR:
+                    // Jangan memanggil AI validator/perbaikan satu per satu untuk setiap soal.
+                    // Sebelumnya 20 soal dapat memicu puluhan request Gemini berurutan,
+                    // sehingga proses terasa sangat lama dan berisiko terkena batas kuota.
+                    // Pembuatan soal cukup memakai satu request AI; pemeriksaan awal berikut
+                    // dilakukan secara lokal tanpa menunggu request AI tambahan.
+                    setStatus(`AI selesai membuat ${normalized.length} soal. Memeriksa struktur dan kelengkapan secara lokal...`);
+                    const prepared=normalized.map(q=>repairQuestionForValidation(q));
+                    const checked=prepared.map((q,i)=>{
+                        const issues=[...new Set([
+                            ...(Array.isArray(q.generatorValidation?.issues)?q.generatorValidation.issues:[]),
+                            ...validateAIQuestion(q)
+                        ])];
+                        const status=issues.length?'PERLU PERBAIKAN':'BELUM DITELAAH AI';
+                        return {
+                            q:{...q,generatorValidation:{
+                                ...(q.generatorValidation||{}),
+                                status:issues.length?'perlu_perbaikan':'belum_ditelAAI',
+                                issues,
+                                aiChecked:false,
+                                aiStatus:'BELUM DITELAAH AI'
+                            }},
+                            issues,index:i,status
+                        };
+                    });
                     const countStatus=key=>checked.filter(x=>x.status===key).length;
-                    setPreview(checked); setStatus(`Ringkasan mutu: ${prepared.length} dibuat; ${countStatus('LULUS VALIDASI')} lulus; ${countStatus('GAGAL VALIDASI')} gagal; ${countStatus('BELUM DITELAAH AI')} belum ditelaah AI. Semua soal dapat ditambahkan ke Editor; status dan catatan validasi tetap ditampilkan agar dapat diperiksa atau diperbaiki setelah masuk Editor.`);
+                    setPreview(checked);
+                    setStatus(`Selesai membuat ${prepared.length} soal. Pemeriksaan lokal: ${countStatus('PERLU PERBAIKAN')} perlu diperbaiki dan ${countStatus('BELUM DITELAAH AI')} belum ditelaah AI. Soal dapat langsung dimasukkan ke Editor. Validasi AI mendalam tetap dapat dilakukan kemudian pada Editor untuk soal yang dipilih.`);
                 } catch(e) {
                     if(mode==='ai') {
                         try {
@@ -2137,7 +2321,9 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
             };
             const accept = () => {
                 if(!preview.length) return alert('Belum ada soal yang dapat ditambahkan ke Editor. Silakan buat soal terlebih dahulu.');
-                // Jangan blokir pemindahan soal berdasarkan hasil validasi.
+                const malformedOptions = preview.filter(x => Array.isArray(x.q?.generatorOptionIssues) && x.q.generatorOptionIssues.length);
+                if (malformedOptions.length) return alert(`${malformedOptions.length} soal memiliki opsi yang hanya berupa huruf/label. Soal tersebut tidak dimasukkan ke Editor agar tidak digunakan dalam ujian. Klik Buat Soal kembali untuk menghasilkan opsi jawaban yang lengkap.`);
+                // Jangan blokir pemindahan soal berdasarkan hasil validasi lainnya.
                 // Semua butir dipindahkan; status dan catatan validasi ikut dibawa
                 // agar guru dapat memeriksa dan memperbaikinya di Editor.
                 onGenerate(preview.map(x=>({
@@ -2150,7 +2336,7 @@ SKEMA JSON WAJIB: setiap objek memiliki id,type,text,stimulus,options,correct,st
                     }
                 })));
             };
-            return <div className="fixed inset-0 z-[70] bg-black bg-opacity-50 flex items-center justify-center p-4 fade-in"><div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] overflow-y-auto"><div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white z-10"><div><h3 className="text-xl font-extrabold text-gray-800">🤖 Generator Soal TKA SD</h3><p className="text-xs text-gray-500 mt-1">AI Gemini dengan API key milik sekolah. Jika model utama sedang padat/gagal, sistem otomatis beralih ke model Gemini Flash cadangan. Gambar yang diperlukan dibuat otomatis oleh AI, lalu diperiksa oleh validator lokal dan generator cadangan.</p></div><button onClick={onCancel}><X size={24}/></button></div><div className="p-6 space-y-5"><div className="grid md:grid-cols-3 gap-4"><div><label className="block text-sm font-bold mb-1">Mata Uji</label><select value={subject} onChange={e=>{const nextSubject=e.target.value;const nextElement=nextSubject==='Matematika'?'Bilangan':'Keterampilan Membaca';const nextCompetency=nextSubject==='Matematika'?'Pemecahan masalah matematis':'Pemahaman Tekstual';setSubject(nextSubject);setElement(nextElement);setCompetency(nextCompetency);const nextSub=nextSubject==='Matematika'?(TKA_META.mathSubelements[nextElement]||[])[0]||'':(TKA_META.biSubcompetencies[nextCompetency]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection(nextSubject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg"><option>Matematika</option><option>Bahasa Indonesia</option></select></div><div><label className="block text-sm font-bold mb-1">Elemen</label>{subject==='Matematika'?<select value={element} onChange={e=>{const nextElement=e.target.value;setElement(nextElement);const nextSub=(TKA_META.mathSubelements[nextElement]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection((TKA_META.mathCoverage[nextSub]||[])[0]||'')}} className="w-full p-3 border rounded-lg">{TKA_META.mathElements.map(x=><option key={x}>{x}</option>)}</select>:<input readOnly value="Keterampilan Membaca" className="w-full p-3 border rounded-lg bg-gray-50"/>}</div><div><label className="block text-sm font-bold mb-1">Level Kognitif</label><select value={level} onChange={e=>{setLevel(e.target.value);setThinkingProcess(TKA_META.cognitive[e.target.value][0])}} className="w-full p-3 border rounded-lg">{Object.keys(TKA_META.cognitive).map(x=><option key={x}>{x}</option>)}</select></div><div><label className="block text-sm font-bold mb-1">Kompetensi</label><select value={competency} onChange={e=>{setCompetency(e.target.value);const next=subject==='Bahasa Indonesia'?(TKA_META.biSubcompetencies[e.target.value]||[]):(TKA_META.mathSubelements[element]||[]);const nextSub=next[0]||'';setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{(subject==='Matematika'?['Pengetahuan matematika','Representasi matematis','Penalaran','Pemecahan masalah matematis','Koneksi matematis']:TKA_META.biCompetencies).map(x=><option key={x}>{x}</option>)}</select></div><div className="md:col-span-3"><label className="block text-sm font-bold mb-1">{subject==='Bahasa Indonesia'?'Subkompetensi':'Sub-elemen / Submateri'}</label><select value={subSelection} onChange={e=>{const nextSub=e.target.value;setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{availableSubSelections.map(x=><option key={x}>{x}</option>)}{availableSubSelections.length===0&&<option value="">Tidak tersedia</option>}</select><p className="text-xs text-gray-500 mt-1">Pilihan mengikuti kompetensi/elemen yang dipilih dan kerangka TKA SD.</p></div>{subject==='Matematika'&&<div className="md:col-span-3"><label className="block text-sm font-bold mb-1">Pilihan Cakupan Sub-elemen</label><select value={coverageSelection} onChange={e=>setCoverageSelection(e.target.value)} className="w-full p-3 border rounded-lg"><option value="">Semua cakupan pada sub-elemen</option>{availableCoverages.map(x=><option key={x} value={x}>{x}</option>)}</select><p className="text-xs text-gray-500 mt-1">Pilih cakupan sesuai tabel kerangka TKA SD. Cakupan ini menjadi dasar pembuatan dan analisis butir Matematika.</p></div>}<div className="md:col-span-3 border rounded-xl p-4 bg-gray-50"><label className="block text-sm font-bold mb-2">Bentuk Soal dan Jumlah Soal</label><p className="text-xs text-gray-500 mb-3">Pilih jumlah masing-masing bentuk soal. Semua bentuk dapat dibuat sekaligus pada kompetensi yang dipilih.</p><div className="grid md:grid-cols-3 gap-3"><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PG Sederhana</div><div className="text-xs text-gray-500 mb-2">1 jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.single} onChange={e=>setTypeCount('single',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK MCMA</div><div className="text-xs text-gray-500 mb-2">lebih dari satu jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.complex} onChange={e=>setTypeCount('complex',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK Kategori</div><div className="text-xs text-gray-500 mb-2">pernyataan benar/salah</div><input type="number" min="0" max="20" value={questionCounts.statement} onChange={e=>setTypeCount('statement',e.target.value)} className="w-full p-2 border rounded-lg"/></div></div><div className="mt-3 text-sm font-bold text-indigo-700">Total soal: {totalCount} / 20</div></div><div><label className="block text-sm font-bold mb-1">Kesulitan</label><select value={difficulty} onChange={e=>setDifficulty(e.target.value)} className="w-full p-3 border rounded-lg"><option>Mudah</option><option>Sedang</option><option>Sulit</option></select></div><div><label className="block text-sm font-bold mb-1">Jenis</label><select value={itemType} onChange={e=>setItemType(e.target.value)} className="w-full p-3 border rounded-lg"><option>Tunggal</option><option>Grup</option></select></div><div><label className="block text-sm font-bold mb-1">Sumber Generator</label><select value={mode} onChange={e=>setMode(e.target.value)} className="w-full p-3 border rounded-lg"><option value="ai">AI Gemini (API Key Sekolah)</option><option value="local">Lokal / Cadangan</option></select></div><div><label className="block text-sm font-bold mb-1">API Key AI</label><input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="API key Gemini sekolah" className="w-full p-3 border rounded-lg"/><label className="text-xs text-gray-500 flex items-center gap-2 mt-1"><input type="checkbox" checked={showKey} onChange={e=>setShowKey(e.target.checked)}/> Tampilkan key</label><p className="text-xs text-orange-700 mt-1">Jangan bagikan file HTML yang berisi key. Key hanya disimpan selama sesi browser.</p></div></div><div><label className="block text-sm font-bold mb-1">Topik atau konteks tambahan (opsional)</label><input value={topic} onChange={e=>setTopic(e.target.value)} placeholder="Contoh: lingkungan sekolah, pecahan, diagram batang" className="w-full p-3 border rounded-lg"/></div>{status&&<div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-sm text-blue-900">{status}</div>}{preview.length>0&&<div className="space-y-3"><div className="flex justify-between items-center"><h4 className="font-bold">Hasil AI</h4></div>{preview.map(({q,issues,status:reviewStatus},i)=><div key={q.id} className="border rounded-xl p-4"><div className="flex justify-between gap-3"><b>Soal {i+1} — {q.examTitle||'Tanpa judul'}</b><span className={`text-xs px-2 py-1 rounded ${reviewStatus==='LULUS VALIDASI'?'bg-green-100 text-green-800':reviewStatus==='BELUM DITELAAH AI'?'bg-blue-100 text-blue-800':'bg-orange-100 text-orange-800'}`}>{reviewStatus||'PERLU DITELAAH'}</span></div><p className="mt-1 text-xs text-gray-600">{q.subject} • {q.element||'Elemen belum ditentukan'} • {q.competency||q.subcompetency||'Kompetensi belum ditentukan'} • {q.type==='single'?'PG Sederhana':q.type==='complex'?'PGK-MCMA':'PGK Kategori'} • {q.cognitiveLevel||'Level belum ditentukan'}</p><p className="mt-2 text-sm whitespace-pre-wrap">{q.text}</p>{q.image&&<div className="mt-3 rounded-lg border bg-gray-50 p-2"><div className="text-xs font-semibold text-gray-500 mb-2">Gambar dibuat otomatis oleh AI</div><img src={q.image} alt={q.imageAlt||"Gambar pendukung soal"} className="max-w-full max-h-64 mx-auto object-contain" /></div>}{q.imageRequired&&!q.image&&<div className="mt-3 text-xs text-orange-700 bg-orange-50 border border-orange-200 rounded-lg p-2">AI menandai soal ini membutuhkan gambar, tetapi gambar belum berhasil dibuat. Soal dapat diperbaiki di Editor.</div>}{Array.isArray(q.options)&&q.options.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.options.map((o,j)=><li key={j}>{q.optionImages&&q.optionImages[j]&&<img src={q.optionImages[j]} alt={`Gambar opsi ${j+1}`} className="max-h-20 max-w-full object-contain mb-1"/>}{o}</li>)}</ol>}{Array.isArray(q.statements)&&q.statements.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.statements.map((st,j)=><li key={j}>{st.text} <span className="text-gray-500">({typeof st.correct==='boolean'?(st.correct?'Benar/Sesuai':'Salah/Tidak sesuai'):'kunci belum ada'})</span></li>)}</ol>}<details className="mt-3 text-sm"><summary className="cursor-pointer font-semibold">Kunci, pembahasan, dan catatan validasi</summary><p className="mt-2"><b>Kunci:</b> {Array.isArray(q.correct)?q.correct.join('; '):q.correct}</p><p className="mt-2"><b>Pembahasan:</b> {q.explanation}</p>{issues.length>0&&<ul className="list-disc ml-5 mt-2 text-orange-700">{issues.map((x,j)=><li key={j}>{x}</li>)}</ul>}</details></div>)}</div>}</div><div className="p-5 border-t bg-gray-50 flex justify-end gap-3 sticky bottom-0"><button onClick={onCancel} className="px-5 py-2 rounded-lg font-bold text-gray-600">Batal</button><button disabled={busy} onClick={generate} className="px-6 py-2 rounded-lg bg-indigo-600 text-white font-bold">{busy?'Memproses...':'Buat Soal'}</button><button disabled={!preview.length||busy} onClick={accept} className="px-6 py-2 rounded-lg bg-green-600 text-white font-bold">Tambahkan ke Editor</button></div></div></div>;
+            return <div className="fixed inset-0 z-[70] bg-black bg-opacity-50 flex items-center justify-center p-4 fade-in"><div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] overflow-y-auto"><div className="p-6 border-b flex justify-between items-center sticky top-0 bg-white z-10"><div><h3 className="text-xl font-extrabold text-gray-800">🤖 Generator Soal TKA SD</h3><p className="text-xs text-gray-500 mt-1">AI Gemini dengan API key milik sekolah. Jika model utama sedang padat/gagal, sistem otomatis beralih ke model Gemini Flash cadangan. Gambar yang diperlukan dibuat otomatis oleh AI, lalu diperiksa oleh validator lokal dan generator cadangan.</p></div><button onClick={onCancel}><X size={24}/></button></div><div className="p-6 space-y-5"><div className="grid md:grid-cols-3 gap-4"><div><label className="block text-sm font-bold mb-1">Mata Uji</label><select value={subject} onChange={e=>{const nextSubject=e.target.value;const nextElement=nextSubject==='Matematika'?'Bilangan':'Keterampilan Membaca';const nextCompetency=nextSubject==='Matematika'?'Pemecahan masalah matematis':'Pemahaman Tekstual';setSubject(nextSubject);setElement(nextElement);setCompetency(nextCompetency);const nextSub=nextSubject==='Matematika'?(TKA_META.mathSubelements[nextElement]||[])[0]||'':(TKA_META.biSubcompetencies[nextCompetency]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection(nextSubject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg"><option>Matematika</option><option>Bahasa Indonesia</option></select></div><div><label className="block text-sm font-bold mb-1">Elemen</label>{subject==='Matematika'?<select value={element} onChange={e=>{const nextElement=e.target.value;setElement(nextElement);const nextSub=(TKA_META.mathSubelements[nextElement]||[])[0]||'';setSubSelection(nextSub);setCoverageSelection((TKA_META.mathCoverage[nextSub]||[])[0]||'')}} className="w-full p-3 border rounded-lg">{TKA_META.mathElements.map(x=><option key={x}>{x}</option>)}</select>:<input readOnly value="Keterampilan Membaca" className="w-full p-3 border rounded-lg bg-gray-50"/>}</div><div><label className="block text-sm font-bold mb-1">Level Kognitif</label><select value={level} onChange={e=>{setLevel(e.target.value);setThinkingProcess(TKA_META.cognitive[e.target.value][0])}} className="w-full p-3 border rounded-lg">{Object.keys(TKA_META.cognitive).map(x=><option key={x}>{x}</option>)}</select></div><div><label className="block text-sm font-bold mb-1">Kompetensi</label><select value={competency} onChange={e=>{setCompetency(e.target.value);const next=subject==='Bahasa Indonesia'?(TKA_META.biSubcompetencies[e.target.value]||[]):(TKA_META.mathSubelements[element]||[]);const nextSub=next[0]||'';setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{(subject==='Matematika'?['Pengetahuan matematika','Representasi matematis','Penalaran','Pemecahan masalah matematis','Koneksi matematis']:TKA_META.biCompetencies).map(x=><option key={x}>{x}</option>)}</select></div><div className="md:col-span-3"><label className="block text-sm font-bold mb-1">{subject==='Bahasa Indonesia'?'Subkompetensi':'Sub-elemen / Submateri'}</label><select value={subSelection} onChange={e=>{const nextSub=e.target.value;setSubSelection(nextSub);setCoverageSelection(subject==='Matematika'?(TKA_META.mathCoverage[nextSub]||[])[0]||'':'')}} className="w-full p-3 border rounded-lg">{availableSubSelections.map(x=><option key={x}>{x}</option>)}{availableSubSelections.length===0&&<option value="">Tidak tersedia</option>}</select><p className="text-xs text-gray-500 mt-1">Pilihan mengikuti kompetensi/elemen yang dipilih dan kerangka TKA SD.</p></div>{subject==='Matematika'&&<div className="md:col-span-3"><label className="block text-sm font-bold mb-1">Pilihan Cakupan Sub-elemen</label><select value={coverageSelection} onChange={e=>setCoverageSelection(e.target.value)} className="w-full p-3 border rounded-lg"><option value="">Semua cakupan pada sub-elemen</option>{availableCoverages.map(x=><option key={x} value={x}>{x}</option>)}</select><p className="text-xs text-gray-500 mt-1">Pilih cakupan sesuai tabel kerangka TKA SD. Cakupan ini menjadi dasar pembuatan dan analisis butir Matematika.</p></div>}<div className="md:col-span-3 border rounded-xl p-4 bg-gray-50"><label className="block text-sm font-bold mb-2">Bentuk Soal dan Jumlah Soal</label><p className="text-xs text-gray-500 mb-3">Pilih jumlah masing-masing bentuk soal. Semua bentuk dapat dibuat sekaligus pada kompetensi yang dipilih.</p><div className="grid md:grid-cols-3 gap-3"><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PG Sederhana</div><div className="text-xs text-gray-500 mb-2">1 jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.single} onChange={e=>setTypeCount('single',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK MCMA</div><div className="text-xs text-gray-500 mb-2">lebih dari satu jawaban benar</div><input type="number" min="0" max="20" value={questionCounts.complex} onChange={e=>setTypeCount('complex',e.target.value)} className="w-full p-2 border rounded-lg"/></div><div className="bg-white border rounded-lg p-3"><div className="font-bold text-sm">PGK Kategori</div><div className="text-xs text-gray-500 mb-2">pernyataan benar/salah</div><input type="number" min="0" max="20" value={questionCounts.statement} onChange={e=>setTypeCount('statement',e.target.value)} className="w-full p-2 border rounded-lg"/></div></div><div className="mt-3 text-sm font-bold text-indigo-700">Total soal: {totalCount} / 20</div></div><div><label className="block text-sm font-bold mb-1">Kesulitan</label><select value={difficulty} onChange={e=>setDifficulty(e.target.value)} className="w-full p-3 border rounded-lg"><option>Mudah</option><option>Sedang</option><option>Sulit</option></select></div><div><label className="block text-sm font-bold mb-1">Jenis</label><select value={itemType} onChange={e=>setItemType(e.target.value)} className="w-full p-3 border rounded-lg"><option>Tunggal</option><option>Grup</option></select></div><div><label className="block text-sm font-bold mb-1">Sumber Generator</label><select value={mode} onChange={e=>setMode(e.target.value)} className="w-full p-3 border rounded-lg"><option value="ai">AI Gemini (API Key Sekolah)</option><option value="local">Lokal / Cadangan</option></select></div><div><label className="block text-sm font-bold mb-1">API Key AI</label><input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="API key Gemini sekolah" className="w-full p-3 border rounded-lg"/><label className="text-xs text-gray-500 flex items-center gap-2 mt-1"><input type="checkbox" checked={showKey} onChange={e=>setShowKey(e.target.checked)}/> Tampilkan key</label><p className="text-xs text-orange-700 mt-1">Jangan bagikan file HTML yang berisi key. Key hanya disimpan selama sesi browser.</p></div></div><div><label className="block text-sm font-bold mb-1">Topik atau konteks tambahan (opsional)</label><input value={topic} onChange={e=>setTopic(e.target.value)} placeholder="Contoh: lingkungan sekolah, pecahan, diagram batang" className="w-full p-3 border rounded-lg"/></div>{status&&<div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-sm text-blue-900">{status}</div>}{preview.length>0&&<div className="space-y-2"><div className="flex justify-between items-center"><h4 className="font-bold">Hasil AI</h4></div>{preview.map(({q,issues,status:reviewStatus},i)=><div key={q.id} className="border rounded-xl p-4"><div className="flex justify-between gap-3"><b>Soal {i+1} — {q.examTitle||'Tanpa judul'}</b><span className={`text-xs px-2 py-1 rounded ${reviewStatus==='LULUS VALIDASI'?'bg-green-100 text-green-800':reviewStatus==='BELUM DITELAAH AI'?'bg-blue-100 text-blue-800':'bg-orange-100 text-orange-800'}`}>{reviewStatus||'PERLU DITELAAH'}</span></div><p className="mt-1 text-xs text-gray-600">{q.subject} • {q.element||'Elemen belum ditentukan'} • {q.competency||q.subcompetency||'Kompetensi belum ditentukan'} • {q.type==='single'?'PG Sederhana':q.type==='complex'?'PGK-MCMA':'PGK Kategori'} • {q.cognitiveLevel||'Level belum ditentukan'}</p><p className="mt-2 text-sm whitespace-pre-wrap">{q.text}</p>{q.image&&<div className="mt-3 rounded-lg border bg-gray-50 p-2"><div className="text-xs font-semibold text-gray-500 mb-2">Gambar dibuat otomatis oleh AI</div><img src={q.image} alt={q.imageAlt||"Gambar pendukung soal"} className="max-w-full max-h-64 mx-auto object-contain" /></div>}{q.imageRequired&&!q.image&&<div className="mt-3 text-xs text-orange-700 bg-orange-50 border border-orange-200 rounded-lg p-2">AI menandai soal ini membutuhkan gambar, tetapi gambar belum berhasil dibuat. Soal dapat diperbaiki di Editor.</div>}{Array.isArray(q.options)&&q.options.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.options.map((o,j)=><li key={j}>{q.optionImages&&q.optionImages[j]&&<img src={q.optionImages[j]} alt={`Gambar opsi ${j+1}`} className="max-h-20 max-w-full object-contain mb-1"/>}{o}</li>)}</ol>}{Array.isArray(q.statements)&&q.statements.length>0&&<ol className="list-decimal ml-6 mt-2 text-sm">{q.statements.map((st,j)=><li key={j}>{st.text} <span className="text-gray-500">({typeof st.correct==='boolean'?(st.correct?'Benar/Sesuai':'Salah/Tidak sesuai'):'kunci belum ada'})</span></li>)}</ol>}<details className="mt-3 text-sm"><summary className="cursor-pointer font-semibold">Kunci, pembahasan, dan catatan validasi</summary><p className="mt-2"><b>Kunci:</b> {Array.isArray(q.correct)?q.correct.join('; '):q.correct}</p><p className="mt-2"><b>Pembahasan:</b> {q.explanation}</p>{issues.length>0&&<ul className="list-disc ml-5 mt-2 text-orange-700">{issues.map((x,j)=><li key={j}>{x}</li>)}</ul>}</details></div>)}</div>}</div><div className="p-5 border-t bg-gray-50 flex justify-end gap-3 sticky bottom-0"><button onClick={onCancel} className="px-5 py-2 rounded-lg font-bold text-gray-600">Batal</button><button disabled={busy} onClick={generate} className="px-6 py-2 rounded-lg bg-indigo-600 text-white font-bold">{busy?'Memproses...':'Buat Soal'}</button><button disabled={!preview.length||busy} onClick={accept} className="px-6 py-2 rounded-lg bg-green-600 text-white font-bold">Tambahkan ke Editor</button></div></div></div>;
         };
 
 
@@ -2386,6 +2572,7 @@ ATURAN KONSTRUKSI VARIATIF — INI WAJIB, BUKAN SEKADAR SARAN:
 8. Untuk Matematika, semua soal wajib berangkat dari situasi kehidupan sehari-hari yang masuk akal bagi murid SD. Narasi umumnya 2–4 kalimat padat dan bermakna; jangan hanya meminta hitung rutin. Jangan pernah menambahkan label atau judul seperti “Situasi sehari-hari:” di dalam soal; konteks kehidupan harus menyatu alami dalam narasi soal dan bukan ditampilkan sebagai kotak pengantar terpisah. Pada level Aplikasi/Penalaran, tuntut sedikitnya dua tahap berpikir seperti memilih informasi, membandingkan strategi, memeriksa kewajaran, atau mengevaluasi klaim. SETIAP soal Matematika wajib memiliki imageSvg berupa ilustrasi relevan, sekurang-kurangnya skema sederhana benda/situasi; jangan biarkan imageSvg kosong. Jika jawaban bergantung pada visual, imageRequired=true. Jangan membuat seluruh paket berupa cerita lalu hanya bertanya 'berapa hasilnya'. Gunakan variasi tabel, data, perbandingan, pengukuran, diagram, keputusan, estimasi, dan pemecahan masalah multi-langkah sesuai blueprint.
 9. Untuk Bahasa Indonesia, variasikan teks informasi, fiksi, pengumuman, petunjuk, percakapan, tabel/daftar informasi, dan bentuk stimulus lain yang relevan. Variasikan lokasi informasi dan jenis inferensi. Jangan membuat semua pertanyaan berbentuk 'berdasarkan teks'.
 10. PG sederhana tepat 4 opsi dan tepat 1 kunci. PGK MCMA minimal 3 opsi dan minimal 2 kunci. PGK kategori minimal 3 pernyataan dengan respons yang sesuai konteks.
+10a. DILARANG mengisi opsi dengan huruf/label saja seperti "A", "B", "C", atau "D", termasuk jika label itu muncul sebagai teks opsi pertama. Setiap opsi harus berupa isi jawaban yang lengkap dan relevan; aplikasi akan menambahkan label A/B/C/D secara otomatis. Nilai correct harus berupa teks opsi yang persis sama, bukan huruf atau nomor indeks. Periksa satu per satu seluruh isi options sebelum mengembalikan JSON.
 11. Semua angka, satuan, fakta, kunci, opsi, dan pembahasan harus konsisten. Pengecoh harus berasal dari kesalahan berpikir yang masuk akal, bukan dibuat asal.
 12. Level kognitif dan proses berpikir harus TERLIHAT dari pekerjaan mental yang diminta, bukan hanya ditulis pada metadata.
 13. Jika imageRequired=true, SVG harus benar-benar diperlukan dan seluruh angka/label pada gambar konsisten dengan soal.
@@ -2472,6 +2659,8 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
             };
             const accept=()=>{
                 if(!preview.length) return alert('Belum ada soal tryout. Silakan buat tryout terlebih dahulu.');
+                const malformedOptions = preview.filter(x => Array.isArray(x.q?.generatorOptionIssues) && x.q.generatorOptionIssues.length);
+                if (malformedOptions.length) return alert(`${malformedOptions.length} soal memiliki opsi yang hanya berupa huruf/label. Paket belum dimasukkan ke Editor. Klik Buat Tryout kembali agar AI menghasilkan isi opsi yang lengkap.`);
                 // SEMUA soal hasil generasi boleh masuk Editor.
                 // Status validasi/diversity tetap dipertahankan sebagai informasi dan
                 // dapat diperiksa/diperbaiki di Editor, tetapi tidak lagi menjadi gate.
@@ -2693,7 +2882,7 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
                 if (subject === 'Matematika' && !TKA_META.mathElements.includes(element)) return alert('Elemen Matematika di luar cakupan TKA SD.');
                 if (itemType === 'Grup' && !stimulus.trim()) return alert('Soal grup harus memiliki stimulus bersama.');
                 if (subject === 'Bahasa Indonesia' && stimulus.trim() && (wordCount(stimulus) < 150 || wordCount(stimulus) > 200)) return alert(`Stimulus Bahasa Indonesia harus 150–200 kata. Saat ini ${wordCount(stimulus)} kata.`);
-                let finalData = { ...safeInitial, id: safeInitial.id || Date.now(), type, text, image: questionImage, explanation, explanationHtml: sanitizeExplanationHtml(explanationEditorRef.current?.innerHTML || explanationHtml), subject, element, subelement, cakupanSubelemen: subject==='Matematika' ? (coverageSelection || 'Semua cakupan pada sub-elemen') : '', coverage: subject==='Matematika' ? (coverageSelection || 'Semua cakupan pada sub-elemen') : '', competency, subcompetency, cognitiveLevel, thinkingProcess, itemType, stimulus, stimulusTitle, questionForm:TKA_META.forms[type] };
+                let finalData = { ...safeInitial, id: safeInitial.id || Date.now(), type, text, image: questionImage, explanation, explanationHtml: sanitizeExplanationHtml(explanationHtml || String(explanation || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')), subject, element, subelement, cakupanSubelemen: subject==='Matematika' ? (coverageSelection || 'Semua cakupan pada sub-elemen') : '', coverage: subject==='Matematika' ? (coverageSelection || 'Semua cakupan pada sub-elemen') : '', competency, subcompetency, cognitiveLevel, thinkingProcess, itemType, stimulus, stimulusTitle, questionForm:TKA_META.forms[type] };
                 if (type === 'single') {
                     if (!correctSingle) return alert("Pilih satu kunci jawaban benar!");
                     finalData.options = options; finalData.optionImages = optionImages; finalData.correct = correctSingle;
@@ -2766,9 +2955,23 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
                         <div className="px-6 pb-6">
                             <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 space-y-2">
                                 <label className="block text-sm font-bold text-emerald-900">Pembahasan Soal (Teks, Gambar, dan Objek)</label>
-                                <p className="text-xs text-emerald-800">Anda dapat mengetik langsung, menempelkan teks berformat, tabel, gambar, atau objek yang disalin (Ctrl+V). Untuk gambar dari clipboard/screenshot, klik area editor lalu tekan Ctrl+V. Gambar juga dapat ditempel dari Word atau aplikasi lain jika clipboard menyediakan gambar.</p>
-                                <div ref={explanationEditorRef} contentEditable suppressContentEditableWarning onInput={updateExplanationFromEditor} onPaste={handleExplanationPaste} role="textbox" aria-label="Editor pembahasan soal" aria-multiline="true" className="w-full min-h-[180px] max-h-[420px] overflow-y-auto p-3 border border-emerald-300 rounded-lg bg-white focus:ring-2 focus:ring-emerald-500 outline-none resize-y text-gray-800 leading-6" style={{whiteSpace:'pre-wrap', overflowWrap:'anywhere'}} data-placeholder="Ketik pembahasan atau tempelkan gambar, tabel, dan objek di sini..." />
-                                <div className="text-xs text-emerald-800">Tips: gunakan Ctrl+V untuk paste. Klik Simpan Soal setelah selesai. Gambar yang ditempel disimpan di data soal; ukuran data bisa bertambah.</div>
+                                <p className="text-xs text-emerald-800">Ketik atau tempel pembahasan secara langsung pada kotak di bawah ini. Perubahan akan disimpan bersama soal saat tombol Simpan Soal diklik.</p>
+                                <textarea
+                                    value={explanation}
+                                    onChange={(e) => {
+                                        const value = e.target.value;
+                                        setExplanation(value);
+                                        const escaped = value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+                                        setExplanationHtml(escaped);
+                                    }}
+                                    onBlur={() => setExplanationHtml(prev => prev || explanation.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>'))}
+                                    aria-label="Ketik pembahasan soal"
+                                    placeholder="Ketik pembahasan soal di sini. Jelaskan alasan kunci jawaban benar dan mengapa pilihan lain kurang tepat..."
+                                    rows={8}
+                                    className="w-full min-h-[180px] p-3 border border-emerald-300 rounded-lg bg-white focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none resize-y text-gray-800 leading-6"
+                                    style={{whiteSpace:'pre-wrap', overflowWrap:'anywhere'}}
+                                />
+                                <div className="text-xs text-emerald-800">Pembahasan yang diketik akan tersimpan pada properti explanation dan ikut terbawa saat soal disimpan ke Bank Soal maupun diterbitkan.</div>
                             </div>
                         </div>
                         <div className="p-6 border-t bg-gray-50 flex justify-end gap-3 sticky bottom-0 z-10"><button onClick={onCancel} className="px-6 py-2 rounded-lg font-bold text-gray-600 hover:bg-gray-200 transition">Batal</button><button onClick={handleSave} className="px-6 py-2 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 shadow-lg transition">Simpan Soal</button></div>
@@ -2864,7 +3067,9 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
             const [dashboardView, setDashboardView] = useState('editor'); 
             const [editorSubjectFilter, setEditorSubjectFilter] = useState('Semua');
             const [editorTitleFilter, setEditorTitleFilter] = useState('Semua Judul');
-            const [currentExamId, setCurrentExamId] = useState(null); 
+            const [currentExamId, setCurrentExamId] = useState(null);
+            const [savingToBank, setSavingToBank] = useState(false);
+            const [savingBankMessage, setSavingBankMessage] = useState(''); 
             const [examTitle, setExamTitle] = useState('');
             const [examDuration, setExamDuration] = useState(60);
             const [questions, setQuestions] = useState([]); 
@@ -2899,8 +3104,13 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
             };
             const mergeBankCache = (cloudItems) => {
                 const cloud = Array.isArray(cloudItems) ? cloudItems : [];
-                writeBankCache(cloud);
-                setSavedExams(cloud);
+                // Pertahankan paket localOnly yang belum berhasil diunggah.
+                // Data cloud menjadi sumber utama untuk ID yang sama.
+                const cloudIds = new Set(cloud.map(item => String(item.id)));
+                const pendingLocal = readBankCache().filter(item => item?.localOnly && !cloudIds.has(String(item.id)));
+                const merged = [...cloud, ...pendingLocal];
+                writeBankCache(merged);
+                setSavedExams(merged);
             };
             const [results, setResults] = useState([]);
             const [isGeneratorOpen, setIsGeneratorOpen] = useState(false);
@@ -2987,38 +3197,95 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
                 }
             };
             const handleSaveToBank = async () => {
-                const validation = getQuestionValidation(questions); if (validation.length) return alert('Bank Soal belum memenuhi kontrol TKA:\n\n' + validation.slice(0,12).join('\n'));
-                if (!examTitle.trim()) return alert("Gagal Menyimpan: Judul ujian tidak boleh kosong.");
-                if (questions.length === 0) return alert("Gagal Menyimpan: Anda belum menambahkan soal satupun.");
-                const examData = { title: examTitle, duration: examDuration, questions: questions, lastModified: new Date().toLocaleString(), author: user.email };
+                if (savingToBank) return;
+                setSavingToBank(true);
+                setSavingBankMessage('Memeriksa soal...');
                 try {
+                    if (!auth.currentUser || auth.currentUser.uid !== user?.uid) {
+                        throw new Error('Sesi login guru belum aktif. Silakan keluar lalu masuk kembali.');
+                    }
+                    if (!String(examTitle || '').trim()) throw new Error('Judul ujian tidak boleh kosong.');
+                    if (!Array.isArray(questions) || questions.length === 0) throw new Error('Belum ada soal yang dapat disimpan.');
+
+                    const validation = getQuestionValidation(questions);
+                    if (validation.length) {
+                        alert('Bank Soal belum memenuhi kontrol TKA:\n\n' + validation.slice(0, 12).join('\n'));
+                        return;
+                    }
+
+                    setSavingBankMessage('Menyiapkan data soal...');
+                    const editorExamData = {
+                        title: String(examTitle).trim(),
+                        duration: Number(examDuration) || 60,
+                        questions: JSON.parse(JSON.stringify(questions)),
+                        lastModified: new Date().toLocaleString('id-ID'),
+                        author: user.email || ''
+                    };
+                    const storageScope = currentExamId && !String(currentExamId).startsWith('local-')
+                        ? currentExamId : `bank-${Date.now()}`;
+
+                    setSavingBankMessage('Mengompresi gambar di perangkat...');
+                    const cloudExamData = await externalizeExamImages(
+                        editorExamData, user.uid, storageScope,
+                        ({ completed, total }) => setSavingBankMessage(
+                            total ? `Mengompresi gambar ${completed}/${total}...` : 'Menyiapkan gambar...'
+                        )
+                    );
+
+                    setSavingBankMessage('Menyimpan data ke Firestore...');
+                    const estimatedBytes = estimateFirestoreBytes(cloudExamData);
+                    if (estimatedBytes > FIRESTORE_SAFE_DOCUMENT_BYTES) {
+                        throw new Error(`Paket masih sekitar ${Math.ceil(estimatedBytes / 1024)} KB setelah kompresi. Batas aman aplikasi adalah 950 KiB agar tetap ada ruang untuk overhead dokumen Firestore (batas keras 1 MiB). Kurangi ukuran gambar atau pecah paket jika masih melebihi 950 KiB; data Editor tetap dipertahankan.`);
+                    }
+
                     let savedItem;
-                    if (currentExamId) {
-                        const targetRef = doc(db, 'artifacts', appId, 'users', user.uid, 'exams', currentExamId);
-                        await setDoc(targetRef, examData, { merge: true });
-                        savedItem = { id: currentExamId, ...examData };
+                    const firestoreWrite = currentExamId && !String(currentExamId).startsWith('local-')
+                        ? setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'exams', currentExamId), cloudExamData, { merge: true })
+                        : addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'exams'), cloudExamData);
+                    const writeResult = await Promise.race([
+                        firestoreWrite,
+                        new Promise((_, reject) => setTimeout(
+                            () => reject(new Error('Penyimpanan ke Firestore belum mendapat respons setelah 45 detik. Periksa koneksi internet dan Firestore Rules. Data editor tetap dipertahankan; jangan klik simpan berulang kali dulu.')),
+                            45000
+                        ))
+                    ]);
+                    if (currentExamId && !String(currentExamId).startsWith('local-')) {
+                        savedItem = { id: currentExamId, ...editorExamData };
                     } else {
-                        const docRef = await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'exams'), examData);
-                        setCurrentExamId(docRef.id);
-                        savedItem = { id: docRef.id, ...examData };
+                        setCurrentExamId(writeResult.id);
+                        savedItem = { id: writeResult.id, ...editorExamData };
                     }
-                    // Backup lokal per akun. Data tetap tersedia setelah browser/file dibuka kembali.
-                    const existing = readBankCache().filter(x => x.id !== savedItem.id);
-                    writeBankCache([...existing, savedItem]);
-                    alert("Berhasil disimpan ke Bank Soal Cloud dan dicadangkan di perangkat ini.");
+
+                    setSavingBankMessage('Memperbarui daftar Bank Soal...');
+                    const existing = readBankCache().filter(x => String(x.id) !== String(savedItem.id));
+                    const updatedBank = [...existing, savedItem];
+                    writeBankCache(updatedBank);
+                    setSavedExams(updatedBank);
+                    alert('Berhasil disimpan ke Bank Soal Cloud. Gambar telah dikompresi di perangkat; Firebase Storage tidak diperlukan.');
                 } catch (e) {
-                    // Jika Firestore gagal, tetap simpan salinan lokal agar paket tidak hilang dari Editor/Bank lokal.
+                    console.error('Save Bank Error:', e);
                     try {
-                        const localId = currentExamId || `local-${Date.now()}`;
-                        const localItem = { id: localId, ...examData, localOnly: true };
-                        const existing = readBankCache().filter(x => x.id !== localId);
-                        writeBankCache([...existing, localItem]);
-                        setSavedExams([...existing, localItem]);
-                        if (!currentExamId) setCurrentExamId(localId);
-                        alert("Firestore gagal menyimpan, tetapi paket soal sudah dicadangkan secara lokal.\n\n" + firebaseErrorText(e));
+                        const localId = currentExamId && String(currentExamId).startsWith('local-') ? currentExamId : `local-${Date.now()}`;
+                        const localItem = {
+                            id: localId, title: String(examTitle || '').trim(),
+                            duration: Number(examDuration) || 60,
+                            questions: JSON.parse(JSON.stringify(questions || [])),
+                            lastModified: new Date().toLocaleString('id-ID'),
+                            author: user?.email || '', localOnly: true
+                        };
+                        const existing = readBankCache().filter(x => String(x.id) !== String(localId));
+                        const updatedBank = [...existing, localItem];
+                        writeBankCache(updatedBank);
+                        setSavedExams(updatedBank);
+                        if (!currentExamId || !String(currentExamId).startsWith('local-')) setCurrentExamId(localId);
                     } catch (localError) {
-                        alert("Gagal menyimpan Bank Soal: " + e.message);
+                        console.error('Cadangan lokal gagal:', localError);
                     }
+                    const friendly = typeof firebaseErrorText === 'function' ? firebaseErrorText(e) : (e?.message || String(e));
+                    alert('Penyimpanan Bank Soal belum berhasil.\n\n' + friendly + '\n\nData pada Editor tidak dihapus. Jika memungkinkan, salinan lokal juga sudah dicadangkan.');
+                } finally {
+                    setSavingToBank(false);
+                    setSavingBankMessage('');
                 }
             };
 
@@ -3054,16 +3321,22 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
                     }
                     if (!targetRef) throw new Error('Tidak dapat membuat token unik. Silakan coba lagi.');
 
+                    const editorQuestions = JSON.parse(JSON.stringify(questions));
+                    const cloudQuestions = await externalizeExamImages(editorQuestions, user.uid, `published-${token}`);
                     const examData = {
                         title: examTitle.trim(),
                         duration: Number(examDuration) || 60,
-                        questions: JSON.parse(JSON.stringify(questions)),
+                        questions: cloudQuestions,
                         token,
                         teacherId: user.uid,
                         status: 'active',
                         publishedAt: new Date().toISOString()
                     };
 
+                    const estimatedBytes = estimateFirestoreBytes(examData);
+                    if (estimatedBytes > FIRESTORE_SAFE_DOCUMENT_BYTES) {
+                        throw new Error(`Paket ujian masih sekitar ${Math.ceil(estimatedBytes/1024)} KB setelah kompresi. Batas aman aplikasi adalah 950 KiB untuk menyediakan ruang overhead di bawah batas keras Firestore 1 MiB. Kurangi ukuran/jumlah gambar sebelum menerbitkan token.`);
+                    }
                     await setDoc(targetRef, examData);
                     localStorage.setItem(activeTokenKey, token);
                     setActiveExam(examData);
@@ -3514,7 +3787,7 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                                         </div>
                                         <div className="flex gap-2">
                                             <button onClick={() => setIsGeneratorOpen(true)} className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded flex items-center gap-2 font-bold">⚙️ Generate Soal</button><button onClick={() => setIsTryoutGeneratorOpen(true)} className="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded flex items-center gap-2 font-bold">📝 Generate Tryout TKA</button><button onClick={loadTemplate} className="text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded flex items-center gap-2"><Layers size={16}/> Template TKA</button>
-                                            <button onClick={handleSaveToBank} className="text-sm bg-blue-100 hover:bg-blue-200 text-blue-700 px-3 py-2 rounded flex items-center gap-2 font-bold"><Save size={16}/> Simpan ke Bank Soal</button><button onClick={() => downloadWordQuestions(questions, examTitle.trim() || 'TKA_SD')} disabled={!questions.length} className="text-sm bg-purple-100 hover:bg-purple-200 text-purple-700 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-2 rounded flex items-center gap-2 font-bold"><FileText size={16}/> Unduh Word + Kisi-Kisi</button>
+                                            <button type="button" onClick={handleSaveToBank} disabled={savingToBank} title={savingBankMessage || "Simpan ke Bank Soal"} className="text-sm bg-blue-100 hover:bg-blue-200 disabled:opacity-60 disabled:cursor-wait text-blue-700 px-3 py-2 rounded flex items-center gap-2 font-bold">{savingToBank ? <><Loader2 size={16} className="animate-spin"/> {savingBankMessage || "Menyimpan..."}</> : <><Save size={16}/> Simpan ke Bank Soal</>}</button><button onClick={() => downloadWordQuestions(questions, examTitle.trim() || 'TKA_SD')} disabled={!questions.length} className="text-sm bg-purple-100 hover:bg-purple-200 text-purple-700 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-2 rounded flex items-center gap-2 font-bold"><FileText size={16}/> Unduh Word + Kisi-Kisi</button>
                                         </div>
                                     </div>
                                     <div className="p-6 space-y-6">
@@ -5428,7 +5701,7 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
         };
 
         const StudentLogin = ({ onBack, onStartExam }) => {
-            const [formData, setFormData] = useState({ name: '', gender: 'Laki-laki', birthDate: '', birthMonth: '', birthYear: '', school: '', province: '', provinceCode: '', regency: '', token: '' });
+            const [formData, setFormData] = useState({ name: '', nisn: '', birthPlace: '', gender: 'Laki-laki', birthDate: '', birthMonth: '', birthYear: '', school: '', province: '', provinceCode: '', regency: '', token: '' });
             const [error, setError] = useState('');
             const [checking, setChecking] = useState(false);
 
@@ -5436,16 +5709,50 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                 e.preventDefault();
                 setError('');
                 if (!formData.name?.trim() || !formData.school?.trim() || !formData.token?.trim() || !formData.birthDate || !formData.birthMonth || !formData.birthYear || !formData.nisn || !formData.birthPlace?.trim() || !formData.gender) { setError("Mohon lengkapi semua data yang wajib diisi, termasuk asal sekolah."); return; }
+                if (!/^\d{10}$/.test(formData.nisn)) { setError("NISN harus terdiri dari tepat 10 digit angka. Periksa kembali NISN yang dimasukkan."); return; }
                 setChecking(true);
                 try {
                     const tokenUpper = formData.token.trim().toUpperCase();
+
+                    // CEK DUPLIKASI SEJAK AWAL: sebelum murid masuk ke halaman soal,
+                    // periksa apakah kombinasi NISN + token ini sudah memiliki hasil.
+                    // ID harus sama persis dengan ID deterministik saat hasil ujian disimpan.
+                    const earlyResultId = `r_${String(tokenUpper || '').replace(/[^a-zA-Z0-9_-]/g, '')}_${String(formData.nisn || '').replace(/[^a-zA-Z0-9_-]/g, '')}`;
+                    const earlyResultRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', earlyResultId);
+                    const earlyResultSnap = await getDoc(earlyResultRef);
+                    if (earlyResultSnap.exists()) {
+                        const warning = 'Hasil ujian untuk NISN dan token ini sudah pernah dikirim. Murid tidak dapat mengerjakan kembali dengan NISN dan token yang sama.';
+                        setError(warning);
+                        alert(warning);
+                        return;
+                    }
+
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'active_exams', tokenUpper);
                     const docSnap = await getDoc(docRef);
                     if (docSnap.exists()) { 
                         const examData = docSnap.data();
                         
-                        // 🔀 ACAK SOAL DI SINI
-                        const soalAcak = shuffleArray([...examData.questions]);
+                        if (examData.status !== 'active') {
+                            setError("Ujian ini sudah tidak aktif.");
+                            return;
+                        }
+                        if (!Array.isArray(examData.questions) || examData.questions.length === 0) {
+                            setError("Paket ujian tidak memiliki soal yang dapat dikerjakan.");
+                            return;
+                        }
+
+                        // Acak soal dan opsi. Kunci berbasis teks tetap cocok karena opsi
+                        // dan gambar opsinya dipindahkan sebagai satu pasangan.
+                        const soalAcak = shuffleArray(examData.questions.map(q => {
+                            const opts = Array.isArray(q.options) ? q.options : [];
+                            const imgs = Array.isArray(q.optionImages) ? q.optionImages : [];
+                            const order = shuffleArray(opts.map((_, i) => i));
+                            return {
+                                ...q,
+                                options: order.map(i => opts[i]),
+                                optionImages: order.map(i => imgs[i] ?? null)
+                            };
+                        }));
 
                         onStartExam(formData, {
                             ...examData,
@@ -5485,6 +5792,14 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             setFormData({...formData, nisn: hanyaAngka});
         }}
     />
+    {formData.nisn.length > 0 && formData.nisn.length < 10 && (
+        <p className="mt-1 text-xs font-semibold text-red-600" role="alert">
+            NISN belum lengkap. Masukkan 10 digit angka (saat ini {formData.nisn.length} digit).
+        </p>
+    )}
+    {formData.nisn.length === 10 && (
+        <p className="mt-1 text-xs font-semibold text-emerald-700">NISN sudah terdiri dari 10 digit.</p>
+    )}
 </div>
 <select name="gender" className="p-2 border rounded outline-none" onChange={handleChange}>
 <option value="">Pilih Jenis Kelamin</option>
@@ -5559,22 +5874,41 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             const storageKeyAnswers = `tka_answers_${studentData.nisn}_${examData.token}`;
             const storageKeyDoubtful = `tka_doubtful_${studentData.nisn}_${examData.token}`;
             const storageKeyTime = `tka_time_${studentData.nisn}_${examData.token}`;
+            const storageKeyDeadline = `tka_deadline_${studentData.nisn}_${examData.token}`;
+            const submitLockRef = useRef(false);
+            const autoSubmitAttemptRef = useRef(false);
 
-            // Ambil data jika ada, jika tidak mulai dari awal
-            const [answers, setAnswers] = useState(() => {
-                const saved = localStorage.getItem(storageKeyAnswers);
-                return saved ? JSON.parse(saved) : {};
-            });
+            const safeLocalRead = (key, fallback) => {
+                try {
+                    const raw = localStorage.getItem(key);
+                    return raw ? JSON.parse(raw) : fallback;
+                } catch (e) {
+                    console.warn('Pemulihan data lokal gagal:', key, e);
+                    return fallback;
+                }
+            };
+            const initialDeadlineAt = (() => {
+                try {
+                    const storedDeadlineRaw = localStorage.getItem(storageKeyDeadline);
+                    const storedDeadline = Number(storedDeadlineRaw);
+                    if (storedDeadlineRaw !== null && Number.isFinite(storedDeadline) && storedDeadline > 0) return storedDeadline;
+                    const legacyRaw = localStorage.getItem(storageKeyTime);
+                    const legacySeconds = Number(legacyRaw);
+                    const seconds = legacyRaw !== null && Number.isFinite(legacySeconds)
+                        ? Math.max(0, legacySeconds) : Math.max(1, Number(examData.duration) || 60) * 60;
+                    const deadline = Date.now() + seconds * 1000;
+                    localStorage.setItem(storageKeyDeadline, String(deadline));
+                    return deadline;
+                } catch (e) {
+                    return Date.now() + Math.max(1, Number(examData.duration) || 60) * 60000;
+                }
+            })();
+            const [deadlineAt] = useState(initialDeadlineAt);
 
-            const [doubtful, setDoubtful] = useState(() => {
-                const saved = localStorage.getItem(storageKeyDoubtful);
-                return saved ? JSON.parse(saved) : {};
-            });
-
-            const [timeLeft, setTimeLeft] = useState(() => {
-                const savedTime = localStorage.getItem(storageKeyTime);
-                return savedTime ? parseInt(savedTime, 10) : examData.duration * 60;
-            });
+            // Pulihkan jawaban/ragu dari perangkat. Kegagalan storage tidak menghentikan ujian.
+            const [answers, setAnswers] = useState(() => safeLocalRead(storageKeyAnswers, {}));
+            const [doubtful, setDoubtful] = useState(() => safeLocalRead(storageKeyDoubtful, {}));
+            const [timeLeft, setTimeLeft] = useState(() => Math.max(0, Math.ceil((initialDeadlineAt - Date.now()) / 1000)));
             
             // Set isFullscreen awal menjadi true agar tidak langsung menampilkan layar peringatan
             const [isFullscreen, setIsFullscreen] = React.useState(true);
@@ -5582,7 +5916,17 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             React.useEffect(() => {
                 const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
                 const handleVisibility = () => {
-                    if (document.hidden) alert("PERINGATAN: Dilarang pindah tab selama ujian! Setiap pelanggaran akan terekam!");
+                    if (document.hidden) {
+                        // Catatan ini hanya tersimpan di perangkat; bukan bukti pelanggaran server.
+                        try {
+                            const key = `tka_visibility_events_${studentData.nisn}_${examData.token}`;
+                            const events = JSON.parse(localStorage.getItem(key) || '[]');
+                            events.push({ at: new Date().toISOString(), event: 'visibility-hidden' });
+                            localStorage.setItem(key, JSON.stringify(events.slice(-100)));
+                        } catch (e) {
+                            console.warn('Catatan perpindahan tab tidak dapat disimpan lokal:', e);
+                        }
+                    }
                 };
 
                 document.addEventListener("fullscreenchange", handleFullscreenChange);
@@ -5607,18 +5951,18 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             
             // Fitur Auto-Save
             useEffect(() => {
-                localStorage.setItem(storageKeyAnswers, JSON.stringify(answers));
+                try { localStorage.setItem(storageKeyAnswers, JSON.stringify(answers)); }
+                catch (e) { console.warn('Autosave jawaban lokal gagal:', e); }
             }, [answers, storageKeyAnswers]);
 
             useEffect(() => {
-                localStorage.setItem(storageKeyDoubtful, JSON.stringify(doubtful));
+                try { localStorage.setItem(storageKeyDoubtful, JSON.stringify(doubtful)); }
+                catch (e) { console.warn('Autosave penanda ragu lokal gagal:', e); }
             }, [doubtful, storageKeyDoubtful]);
 
-            useEffect(() => {
-                localStorage.setItem(storageKeyTime, timeLeft.toString());
-            }, [timeLeft, storageKeyTime]);
-
             const submitExam = async () => {
+                if (submitLockRef.current) return;
+                submitLockRef.current = true;
                 try {
                     let correctCount = 0;
                     const totalQuestions = examData.questions.length;
@@ -5643,7 +5987,7 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                         }
                     });
 
-                    const score = Math.round((correctCount / totalQuestions) * 100);
+                    const score = totalQuestions > 0 ? Math.round((correctCount / totalQuestions) * 100) : 0;
 
                     // 2. Menyiapkan data hasil untuk dikirim
                     const questionAnalysis = examData.questions.map((q, index) => {
@@ -5700,15 +6044,29 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                     // Bersihkan seluruh payload (termasuk rincian soal, opsi, pernyataan,
                     // kunci, jawaban murid, dan identitas) sebelum dikirim ke Firestore.
                     const safeResultPayload = sanitizeFirestoreData(resultPayload);
-                    await addDoc(
-                        collection(db, 'artifacts', appId, 'public', 'data', 'exam_results'),
-                        safeResultPayload
-                    );
+                    // ID deterministik + transaksi mencegah hasil ganda saat tombol diklik
+                    // berulang atau permintaan terkirim ulang setelah koneksi lambat.
+                    const resultId = `r_${String(examData.token || '').replace(/[^a-zA-Z0-9_-]/g, '')}_${String(studentData.nisn || '').replace(/[^a-zA-Z0-9_-]/g, '')}`;
+                    const resultRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', resultId);
+                    await runTransaction(db, async (transaction) => {
+                        const existing = await transaction.get(resultRef);
+                        if (existing.exists()) {
+                            const duplicateError = new Error('Hasil ujian untuk NISN dan token ini sudah pernah dikirim.');
+                            duplicateError.code = 'already-submitted';
+                            throw duplicateError;
+                        }
+                        transaction.set(resultRef, safeResultPayload);
+                    });
 
-                    // 4. Bersihkan penyimpanan lokal agar tidak berat
-                    localStorage.removeItem(storageKeyAnswers);
-                    localStorage.removeItem(storageKeyDoubtful);
-                    localStorage.removeItem(storageKeyTime);
+                    // 4. Bersihkan penyimpanan lokal hanya setelah transaksi cloud berhasil.
+                    try {
+                        localStorage.removeItem(storageKeyAnswers);
+                        localStorage.removeItem(storageKeyDoubtful);
+                        localStorage.removeItem(storageKeyTime);
+                        localStorage.removeItem(storageKeyDeadline);
+                    } catch (storageError) {
+                        console.warn('Pembersihan data lokal gagal:', storageError);
+                    }
 
                     // 5. Pindah ke tampilan skor (Agar murid bisa melihat nilai)
                     if (document.fullscreenElement && document.exitFullscreen) {
@@ -5717,17 +6075,28 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                     onFinish(safeResultPayload);
 
                 } catch (e) {
+                    submitLockRef.current = false;
                     console.error("Gagal mengirim jawaban:", e);
-                    alert("Koneksi bermasalah. Jawaban gagal terkirim: " + e.message);
+                    alert(e?.code === 'already-submitted'
+                        ? e.message
+                        : "Koneksi bermasalah. Jawaban belum berhasil dikonfirmasi tersimpan: " + e.message);
                 }
             };
-       
+
+            // Hitung sisa waktu dari deadline absolut agar tetap akurat setelah reload/tab sleep.
             useEffect(() => {
-                if (timeLeft <= 0) submitExam();
-                const timer = setInterval(() => { setTimeLeft(prev => Math.max(0, prev - 1)); }, 1000);
+                const tick = () => {
+                    const remaining = Math.max(0, Math.ceil((deadlineAt - Date.now()) / 1000));
+                    setTimeLeft(remaining);
+                    if (remaining <= 0 && !autoSubmitAttemptRef.current) {
+                        autoSubmitAttemptRef.current = true;
+                        submitExam();
+                    }
+                };
+                tick();
+                const timer = setInterval(tick, 1000);
                 return () => clearInterval(timer);
-            }, [timeLeft]);
-            
+            }, [deadlineAt, answers]);
             useEffect(() => {
                 renderMath();
             }, [currentQIndex]);
@@ -5739,7 +6108,7 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                 <div className="min-h-screen bg-gray-100 flex flex-col">
                 {!isFullscreen && (
             <div className="fixed inset-0 z-[9999] bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-white">
-                <h2 className="text-2xl font-bold mb-4">Mode Ujian Terhenti! Setiap pelanggaran akan terekam!</h2>
+                <h2 className="text-2xl font-bold mb-4">Mode layar penuh terhenti</h2>
                 <p className="mb-6 opacity-80">Anda keluar dari layar penuh. Klik tombol di bawah untuk kembali mengerjakan.</p>
                 <button onClick={forceFullscreen} className="bg-blue-600 px-10 py-3 rounded-lg font-bold">
                     Kembali ke Layar Penuh
@@ -5941,32 +6310,49 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
         };
 
         const LandingPage = ({ onRoleSelect }) => (
-            <div className="min-h-screen bg-gradient-to-br from-blue-600 to-indigo-800 flex items-center justify-center p-4">
-                <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full text-center fade-in">
-                    <div className="mb-6 flex justify-center"><div className="bg-blue-100 p-4 rounded-full"><Award size={48} className="text-blue-600"/></div></div>
-                    <h1 className="text-3xl font-bold text-gray-800 mb-2">Tryout TKA SD/MI Online</h1>
-                    <p className="text-gray-500 mb-8">Platform Ujian Berbasis Exam Browser</p>
-                    
+            <div className="min-h-screen relative overflow-hidden bg-gradient-to-br from-slate-950 via-blue-950 to-teal-800 flex items-center justify-center p-4 md:p-8">
+                <div className="absolute -top-24 -left-20 w-80 h-80 rounded-full bg-cyan-400/15 blur-3xl pointer-events-none"></div>
+                <div className="absolute -bottom-24 -right-20 w-96 h-96 rounded-full bg-amber-300/15 blur-3xl pointer-events-none"></div>
+
+                <div className="relative bg-white/95 backdrop-blur rounded-[2rem] shadow-2xl shadow-slate-950/40 p-6 sm:p-9 max-w-lg w-full text-center fade-in border border-white/70">
+                    <div className="flex justify-center mb-3">
+                        <div className="rounded-2xl bg-white p-2 shadow-lg ring-1 ring-slate-200">
+                            <img src="data:image/png;base64,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" alt="Logo KKG Kecamatan Bululawang" className="w-20 h-20 sm:w-24 sm:h-24 object-contain" />
+                        </div>
+                    </div>
+
+                    <div className="inline-flex items-center gap-2 rounded-full bg-teal-50 border border-teal-100 px-4 py-1.5 text-xs sm:text-sm font-bold tracking-wide text-teal-800 mb-4">
+                        <span className="w-2 h-2 rounded-full bg-teal-500"></span>
+                        SISTEM LATIHAN DAN TRYOUT DIGITAL
+                    </div>
+
+                    <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 leading-tight mb-2">Tryout TKA SD/MI Online</h1>
+                    <p className="text-slate-600 text-sm sm:text-base mb-6">Platform Ujian Berbasis Exam Browser</p>
+
+                    <div className="h-px bg-gradient-to-r from-transparent via-slate-200 to-transparent mb-6"></div>
+
                     <div className="space-y-3">
-                        {/* Tombol Masuk Murid */}
-                        <button onClick={() => onRoleSelect('student')} className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition duration-200 flex items-center justify-center gap-2 shadow-lg shadow-blue-200">
+                        <button onClick={() => onRoleSelect('student')} className="w-full py-3.5 px-4 bg-gradient-to-r from-teal-600 to-blue-700 hover:from-teal-700 hover:to-blue-800 text-white font-bold rounded-xl transition duration-200 flex items-center justify-center gap-2 shadow-lg shadow-blue-900/20 focus:outline-none focus:ring-4 focus:ring-teal-200">
                             <User size={20}/> Masuk sebagai Murid
                         </button>
-                        
-                        <div className="relative py-2">
-                            <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200"></div></div>
-                            <div className="relative flex justify-center text-sm"><span className="px-2 bg-white text-gray-500">Area Guru</span></div>
+
+                        <div className="relative py-3">
+                            <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-200"></div></div>
+                            <div className="relative flex justify-center text-sm"><span className="px-3 bg-white text-slate-500 font-semibold">Area Guru</span></div>
                         </div>
 
-                        {/* Tombol Login Guru */}
-                        <button onClick={() => onRoleSelect('teacher', 'login')} className="w-full py-3 px-4 bg-white border-2 border-gray-200 hover:border-blue-500 hover:text-blue-600 text-gray-700 font-semibold rounded-lg transition duration-200 flex items-center justify-center gap-2">
+                        <button onClick={() => onRoleSelect('teacher', 'login')} className="w-full py-3.5 px-4 bg-white border-2 border-slate-200 hover:border-blue-500 hover:bg-blue-50 text-slate-700 font-bold rounded-xl transition duration-200 flex items-center justify-center gap-2">
                             <LogIn size={20}/> Login Guru
                         </button>
 
-                        {/* Link Daftar Guru Baru */}
-                        <button onClick={() => onRoleSelect('teacher', 'register')} className="text-sm text-indigo-100 hover:text-white hover:underline mt-2">
+                        <button onClick={() => onRoleSelect('teacher', 'register')} className="text-sm font-semibold text-blue-700 hover:text-teal-700 hover:underline mt-2">
                             Guru Baru? Daftar di sini
                         </button>
+                    </div>
+
+                    <div className="mt-2 mb-1 rounded-xl border border-teal-100 bg-teal-50 px-4 py-3">
+                        <p className="text-xs sm:text-sm text-slate-600">Aplikasi ini dipersembahkan oleh</p>
+                        <p className="text-sm sm:text-base font-extrabold tracking-wide text-teal-800 mt-1">KKG Kec. Bululawang</p>
                     </div>
                 </div>
             </div>
@@ -6031,6 +6417,11 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
 
             return (
                 <>
+                    {!firebaseConfigReady && (
+                        <div role="alert" className="fixed top-0 inset-x-0 z-[10000] bg-amber-100 border-b border-amber-300 text-amber-950 px-4 py-3 text-sm font-semibold text-center shadow">
+                            Konfigurasi Firebase belum lengkap. Aplikasi dapat dibuka, tetapi login dan sinkronisasi cloud belum dapat dianggap siap. Isi konfigurasi Firebase Web yang benar tanpa mengganti projectId lama.
+                        </div>
+                    )}
                     {view === 'landing' && (
                         <LandingPage 
                             onRoleSelect={(role, mode) => {
