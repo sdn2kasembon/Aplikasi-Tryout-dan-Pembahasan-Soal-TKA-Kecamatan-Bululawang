@@ -69,6 +69,7 @@
             deleteDoc,
             query,
             getDocs,
+            where,
             runTransaction
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
@@ -231,6 +232,19 @@
         };
         // Batas internal 950 KiB (di bawah batas keras Firestore 1 MiB), memberi ruang untuk overhead dokumen.
         const FIRESTORE_SAFE_DOCUMENT_BYTES = 950 * 1024;
+
+        // ID stabil untuk membatasi percobaan lintas-token pada ujian yang sama.
+        const makeAttemptLimitId = (teacherId, examTitle, nisn) => {
+            const raw = `${String(teacherId || '').trim()}|${String(examTitle || '').trim().toLocaleLowerCase('id-ID')}|${String(nisn || '').replace(/\\D/g, '')}`;
+            let hash = 2166136261;
+            for (let i = 0; i < raw.length; i++) {
+                hash ^= raw.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+            }
+            return `_limit_${(hash >>> 0).toString(16)}`;
+        };
+        const MAX_EXAM_SUBMISSIONS_PER_STUDENT = 2;
+
 
         // Unggah gambar data-URL ke kompresi gambar lokal; dokumen Firestore hanya menyimpan URL.
         // Paket ini mempertahankan paket Firebase saat ini: tidak memakai kompresi gambar lokal.
@@ -3164,7 +3178,9 @@ Kembalikan HANYA JSON valid berupa array tepat ${totalCount} objek. Skema: id,bl
                const qResults = query(collection(db, 'artifacts', appId, 'public', 'data', 'exam_results'));
 
                 const unsubResults = onSnapshot(qResults, (snapshot) => {
-                    const allResults = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    const allResults = snapshot.docs
+                        .map(doc => ({ id: doc.id, ...doc.data() }))
+                        .filter(item => item._systemType !== 'attempt-limit');
 
                     // ✅ FILTER berdasarkan guru (bukan ujian aktif)
                     const myResults = allResults.filter(r => r.teacherId === user.uid);
@@ -5714,18 +5730,8 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                 try {
                     const tokenUpper = formData.token.trim().toUpperCase();
 
-                    // CEK DUPLIKASI SEJAK AWAL: sebelum murid masuk ke halaman soal,
-                    // periksa apakah kombinasi NISN + token ini sudah memiliki hasil.
-                    // ID harus sama persis dengan ID deterministik saat hasil ujian disimpan.
-                    const earlyResultId = `r_${String(tokenUpper || '').replace(/[^a-zA-Z0-9_-]/g, '')}_${String(formData.nisn || '').replace(/[^a-zA-Z0-9_-]/g, '')}`;
-                    const earlyResultRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', earlyResultId);
-                    const earlyResultSnap = await getDoc(earlyResultRef);
-                    if (earlyResultSnap.exists()) {
-                        const warning = 'Hasil ujian untuk NISN dan token ini sudah pernah dikirim. Murid tidak dapat mengerjakan kembali dengan NISN dan token yang sama.';
-                        setError(warning);
-                        alert(warning);
-                        return;
-                    }
+                    // Anti-duplikasi memakai ID sesi pengerjaan, bukan token.
+                    // Sesi yang sama tidak dapat menghasilkan nilai lebih dari satu kali.
 
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'active_exams', tokenUpper);
                     const docSnap = await getDoc(docRef);
@@ -5740,6 +5746,44 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                             setError("Paket ujian tidak memiliki soal yang dapat dikerjakan.");
                             return;
                         }
+
+                        const attemptLimitId = makeAttemptLimitId(examData.teacherId || '', examData.title || '', formData.nisn);
+                        const attemptLimitRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', attemptLimitId);
+                        // Hitung hasil lama untuk mempertahankan batas sebelum fitur sesi dipasang.
+                        const legacyAttemptsSnap = await getDocs(query(
+                            collection(db, 'artifacts', appId, 'public', 'data', 'exam_results'),
+                            where('teacherId', '==', examData.teacherId || ''),
+                            where('examTitle', '==', examData.title || ''),
+                            where('nisn', '==', formData.nisn)
+                        ));
+                        const legacyAttemptCount = legacyAttemptsSnap.docs.filter(d => d.data()._systemType !== 'attempt-limit').length;
+                        const proposedSessionId = (window.crypto && window.crypto.randomUUID)
+                            ? `s_${window.crypto.randomUUID().replace(/-/g, '')}`
+                            : `s_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+                        const sessionId = await runTransaction(db, async (transaction) => {
+                            const lockSnap = await transaction.get(attemptLimitRef);
+                            const lockData = lockSnap.exists() ? lockSnap.data() : {};
+                            const usedAttempts = Math.max(Number(lockData.count || 0), legacyAttemptCount);
+                            if (usedAttempts >= MAX_EXAM_SUBMISSIONS_PER_STUDENT) {
+                                const limitError = new Error(`Batas pengerjaan untuk ujian "${examData.title}" sudah tercapai (maksimal ${MAX_EXAM_SUBMISSIONS_PER_STUDENT} kali untuk NISN ini).`);
+                                limitError.code = 'attempt-limit-reached';
+                                throw limitError;
+                            }
+                            // Login dari tab/perangkat lain saat sesi masih aktif memakai ID sesi sama.
+                            const activeSessionId = String(lockData.activeSessionId || '');
+                            if (activeSessionId) return activeSessionId;
+                            transaction.set(attemptLimitRef, {
+                                _systemType: 'attempt-limit',
+                                teacherId: examData.teacherId || '',
+                                examTitle: examData.title || '',
+                                nisn: String(formData.nisn || '').replace(/\D/g, ''),
+                                count: usedAttempts,
+                                activeSessionId: proposedSessionId,
+                                activeSince: new Date().toISOString(),
+                                updatedAt: new Date().toISOString()
+                            }, { merge: true });
+                            return proposedSessionId;
+                        });
 
                         // Acak soal dan opsi. Kunci berbasis teks tetap cocok karena opsi
                         // dan gambar opsinya dipindahkan sebagai satu pasangan.
@@ -5756,6 +5800,7 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
 
                         onStartExam(formData, {
                             ...examData,
+                            submissionSessionId: sessionId,
                             questions: soalAcak
                         });
                     } else { 
@@ -6044,18 +6089,56 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                     // Bersihkan seluruh payload (termasuk rincian soal, opsi, pernyataan,
                     // kunci, jawaban murid, dan identitas) sebelum dikirim ke Firestore.
                     const safeResultPayload = sanitizeFirestoreData(resultPayload);
-                    // ID deterministik + transaksi mencegah hasil ganda saat tombol diklik
-                    // berulang atau permintaan terkirim ulang setelah koneksi lambat.
-                    const resultId = `r_${String(examData.token || '').replace(/[^a-zA-Z0-9_-]/g, '')}_${String(studentData.nisn || '').replace(/[^a-zA-Z0-9_-]/g, '')}`;
+                    // Satu sesi pengerjaan memiliki satu ID hasil yang stabil.
+                    // Token dapat berubah, tetapi ID sesi tidak berubah saat pengiriman ulang.
+                    const sessionId = String(examData.submissionSessionId || '');
+                    if (!sessionId) throw new Error('ID sesi pengerjaan tidak ditemukan. Silakan masuk kembali melalui token ujian.');
+                    const resultId = `r_${sessionId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
                     const resultRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', resultId);
+                    const attemptLimitId = makeAttemptLimitId(examData.teacherId || '', examData.title || '', studentData.nisn);
+                    const attemptLimitRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', attemptLimitId);
+                    const legacyAttemptsSnap = await getDocs(query(
+                        collection(db, 'artifacts', appId, 'public', 'data', 'exam_results'),
+                        where('teacherId', '==', examData.teacherId || ''),
+                        where('examTitle', '==', examData.title || ''),
+                        where('nisn', '==', String(studentData.nisn || ''))
+                    ));
+                    const legacyAttemptCount = legacyAttemptsSnap.docs.filter(d => d.data()._systemType !== 'attempt-limit').length;
                     await runTransaction(db, async (transaction) => {
                         const existing = await transaction.get(resultRef);
+                        const limitSnap = await transaction.get(attemptLimitRef);
+                        const lockData = limitSnap.exists() ? limitSnap.data() : {};
                         if (existing.exists()) {
-                            const duplicateError = new Error('Hasil ujian untuk NISN dan token ini sudah pernah dikirim.');
+                            const duplicateError = new Error('Pengiriman sesi ini sudah tersimpan. Nilai tidak dibuat ulang.');
                             duplicateError.code = 'already-submitted';
                             throw duplicateError;
                         }
-                        transaction.set(resultRef, safeResultPayload);
+                        if (String(lockData.activeSessionId || '') !== sessionId) {
+                            const sessionError = new Error('Sesi ini sudah tidak aktif atau telah dikirim dari perangkat lain.');
+                            sessionError.code = 'session-not-active';
+                            throw sessionError;
+                        }
+                        const usedAttempts = Math.max(Number(lockData.count || 0), legacyAttemptCount);
+                        if (usedAttempts >= MAX_EXAM_SUBMISSIONS_PER_STUDENT) {
+                            const limitError = new Error(`Batas pengerjaan ujian ini sudah tercapai. Maksimal ${MAX_EXAM_SUBMISSIONS_PER_STUDENT} kali untuk NISN yang sama.`);
+                            limitError.code = 'attempt-limit-reached';
+                            throw limitError;
+                        }
+                        transaction.set(resultRef, {
+                            ...safeResultPayload,
+                            submissionSessionId: sessionId,
+                            attemptNumber: usedAttempts + 1
+                        });
+                        transaction.set(attemptLimitRef, {
+                            _systemType: 'attempt-limit',
+                            teacherId: examData.teacherId || '',
+                            examTitle: examData.title || '',
+                            nisn: String(studentData.nisn || '').replace(/\D/g, ''),
+                            count: usedAttempts + 1,
+                            activeSessionId: null,
+                            lastSubmittedAt: new Date().toISOString(),
+                            updatedAt: new Date().toISOString()
+                        }, { merge: true });
                     });
 
                     // 4. Bersihkan penyimpanan lokal hanya setelah transaksi cloud berhasil.
@@ -6075,11 +6158,34 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                     onFinish(safeResultPayload);
 
                 } catch (e) {
-                    submitLockRef.current = false;
                     console.error("Gagal mengirim jawaban:", e);
-                    alert(e?.code === 'already-submitted'
+                    // Firestore mungkin sudah menyimpan hasil sebelum koneksi terputus.
+                    // Verifikasi berdasarkan ID sesi sebelum mengizinkan percobaan ulang.
+                    try {
+                        const sessionId = String(examData.submissionSessionId || '');
+                        if (sessionId) {
+                            const committedRef = doc(db, 'artifacts', appId, 'public', 'data', 'exam_results', `r_${sessionId.replace(/[^a-zA-Z0-9_-]/g, '')}`);
+                            const committedSnap = await getDoc(committedRef);
+                            if (committedSnap.exists()) {
+                                const committedResult = committedSnap.data();
+                                try {
+                                    localStorage.removeItem(storageKeyAnswers);
+                                    localStorage.removeItem(storageKeyDoubtful);
+                                    localStorage.removeItem(storageKeyTime);
+                                    localStorage.removeItem(storageKeyDeadline);
+                                } catch (_) {}
+                                if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+                                onFinish(committedResult);
+                                return;
+                            }
+                        }
+                    } catch (verifyError) {
+                        console.warn('Verifikasi hasil setelah gangguan jaringan gagal:', verifyError);
+                    }
+                    submitLockRef.current = false;
+                    alert((e?.code === 'already-submitted' || e?.code === 'attempt-limit-reached' || e?.code === 'session-not-active')
                         ? e.message
-                        : "Koneksi bermasalah. Jawaban belum berhasil dikonfirmasi tersimpan: " + e.message);
+                        : "Koneksi bermasalah. Jawaban belum berhasil dikonfirmasi tersimpan. Silakan coba kembali; ID sesi yang sama mencegah nilai ganda. Detail: " + e.message);
                 }
             };
 
