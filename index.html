@@ -5914,12 +5914,14 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
        const ExamInterface = ({ examData, studentData, onFinish }) => {
             const [currentQIndex, setCurrentQIndex] = useState(0);
             const [showFinishConfirm, setShowFinishConfirm] = useState(false);
+            const [showQuestionList, setShowQuestionList] = useState(false);
              
             // Kunci penyimpanan lokal
             const storageKeyAnswers = `tka_answers_${studentData.nisn}_${examData.token}`;
             const storageKeyDoubtful = `tka_doubtful_${studentData.nisn}_${examData.token}`;
             const storageKeyTime = `tka_time_${studentData.nisn}_${examData.token}`;
             const storageKeyDeadline = `tka_deadline_${studentData.nisn}_${examData.token}`;
+            const storageKeyViolations = `tka_violations_${studentData.nisn}_${examData.token}`;
             const submitLockRef = useRef(false);
             const autoSubmitAttemptRef = useRef(false);
 
@@ -5957,9 +5959,29 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             
             // Set isFullscreen awal menjadi true agar tidak langsung menampilkan layar peringatan
             const [isFullscreen, setIsFullscreen] = React.useState(true);
+            const [violationCount, setViolationCount] = useState(() =>
+                Math.min(3, Math.max(0, Number(safeLocalRead(storageKeyViolations, 0)) || 0))
+            );
+            const wasFullscreenRef = useRef(!!document.fullscreenElement);
 
             React.useEffect(() => {
-                const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
+                const handleFullscreenChange = () => {
+                    const fullscreenActive = !!document.fullscreenElement;
+                    setIsFullscreen(fullscreenActive);
+                    if (wasFullscreenRef.current && !fullscreenActive) {
+                        setViolationCount(previous => {
+                            const nextCount = Math.min(3, previous + 1);
+                            try {
+                                localStorage.setItem(storageKeyViolations, JSON.stringify(nextCount));
+                            } catch (e) {
+                                console.warn('Jumlah pelanggaran tidak dapat disimpan lokal:', e);
+                            }
+                            return nextCount;
+                        });
+                    }
+                    wasFullscreenRef.current = fullscreenActive;
+                };
+                setIsFullscreen(!!document.fullscreenElement);
                 const handleVisibility = () => {
                     if (document.hidden) {
                         // Catatan ini hanya tersimpan di perangkat; bukan bukti pelanggaran server.
@@ -5986,14 +6008,21 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                 if (document.documentElement.requestFullscreen) {
                     document.documentElement.requestFullscreen().catch(err => {
                         console.warn("Fullscreen API diblokir oleh browser:", err);
-                        // Jika Iframe memblokir, kita loloskan agar siswa tetap bisa ikut ujian
-                        setIsFullscreen(true);
+                        setIsFullscreen(false);
+                        alert("Mode layar penuh belum dapat diaktifkan. Izinkan mode layar penuh pada browser, lalu coba kembali.");
                     });
                 } else {
-                    setIsFullscreen(true); // Fallback browser lama
+                    setIsFullscreen(false);
+                    alert("Browser ini tidak mendukung mode layar penuh. Gunakan browser terbaru seperti Google Chrome untuk mengikuti ujian.");
                 }
             };
             
+            // Simpan jumlah pelanggaran agar tidak kembali nol saat halaman dimuat ulang.
+            useEffect(() => {
+                try { localStorage.setItem(storageKeyViolations, JSON.stringify(violationCount)); }
+                catch (e) { console.warn('Penyimpanan jumlah pelanggaran gagal:', e); }
+            }, [violationCount, storageKeyViolations]);
+
             // Fitur Auto-Save
             useEffect(() => {
                 try { localStorage.setItem(storageKeyAnswers, JSON.stringify(answers)); }
@@ -6082,6 +6111,8 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                         examTitle: examData.title,
                         teacherId: examData.teacherId,
                         correctCount, totalQuestions, score, questionAnalysis,
+                        violationCount,
+                        violationLimit: 3,
                         submittedAt: new Date().toISOString()
                     };
 
@@ -6189,6 +6220,35 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
                 }
             };
 
+            // Pengamanan penyalinan selama halaman ujian aktif.
+            useEffect(() => {
+                const stopClipboardAction = (event) => event.preventDefault();
+                const stopCopyShortcut = (event) => {
+                    const key = String(event.key || '').toLowerCase();
+                    const modifier = event.ctrlKey || event.metaKey;
+                    if ((modifier && ['c', 'x', 'a', 'u', 'p'].includes(key)) ||
+                        (event.shiftKey && key === 'insert')) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                    }
+                };
+                document.addEventListener('copy', stopClipboardAction, true);
+                document.addEventListener('cut', stopClipboardAction, true);
+                document.addEventListener('contextmenu', stopClipboardAction, true);
+                document.addEventListener('keydown', stopCopyShortcut, true);
+                return () => {
+                    document.removeEventListener('copy', stopClipboardAction, true);
+                    document.removeEventListener('cut', stopClipboardAction, true);
+                    document.removeEventListener('contextmenu', stopClipboardAction, true);
+                    document.removeEventListener('keydown', stopCopyShortcut, true);
+                };
+            }, []);
+
+            // Pada pelanggaran ketiga, ujian otomatis diselesaikan.
+            useEffect(() => {
+                if (violationCount >= 3) submitExam();
+            }, [violationCount]);
+
             // Hitung sisa waktu dari deadline absolut agar tetap akurat setelah reload/tab sleep.
             useEffect(() => {
                 const tick = () => {
@@ -6208,25 +6268,193 @@ Setelah menyusun ulang, lakukan pemeriksaan mandiri: baca soal sebagai peserta, 
             }, [currentQIndex]);
             
             const currentQ = examData.questions[currentQIndex];
-            const formatTime = (s) => { const m = Math.floor(s / 60); const sec = s % 60; return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`; };
+            const formatTime = (s) => {
+                const m = Math.floor(s / 60);
+                const sec = s % 60;
+                return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+            };
 
             return (
-                <div className="min-h-screen bg-gray-100 flex flex-col">
-                {!isFullscreen && (
-            <div className="fixed inset-0 z-[9999] bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-white">
-                <h2 className="text-2xl font-bold mb-4">Mode layar penuh terhenti</h2>
-                <p className="mb-6 opacity-80">Anda keluar dari layar penuh. Klik tombol di bawah untuk kembali mengerjakan.</p>
-                <button onClick={forceFullscreen} className="bg-blue-600 px-10 py-3 rounded-lg font-bold">
-                    Kembali ke Layar Penuh
-                </button>
-            </div>
-        )}
-                    <ConfirmationModal isOpen={showFinishConfirm} title="Selesaikan Ujian?" message="Yakin sudah selesai?" confirmText="Ya, Selesai" onConfirm={() => { submitExam(); setShowFinishConfirm(false); }} onCancel={() => setShowFinishConfirm(false)} />
-                    <header className="bg-white shadow px-6 py-4 flex justify-between items-center sticky top-0 z-10"><div className="flex items-center gap-3"><div className="bg-blue-600 text-white w-10 h-10 rounded-full flex items-center justify-center font-bold">{studentData.name.charAt(0)}</div><div><h1 className="font-bold text-gray-800 text-sm">{studentData.name}</h1><p className="text-xs text-gray-500">{studentData.school}</p></div></div><div className={`font-mono font-bold text-xl px-4 py-2 rounded-lg flex items-center gap-2 ${timeLeft < 300 ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-600'}`}><Clock size={20}/> {formatTime(timeLeft)}</div></header>
-                    <main className="flex-1 max-w-5xl mx-auto w-full p-4 md:p-6 flex gap-6">
-                        <div className="flex-1 bg-white p-6 md:p-8 rounded-xl shadow-sm min-h-[500px] flex flex-col"><div className="mb-6 flex justify-between items-start border-b pb-4"><div><h2 className="text-gray-400 font-bold uppercase tracking-wider text-xs mb-1">Soal Nomor</h2><span className="text-4xl font-extrabold text-gray-800">{currentQIndex + 1}</span></div><div className="flex flex-col items-end gap-2"><span className="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded-full font-bold">{currentQ.type === 'single' ? 'PG Sederhana' : currentQ.type === 'complex' ? 'PGK MCMA' : 'PGK Kategori'}</span><label className="flex items-center gap-2 cursor-pointer select-none border px-3 py-1 rounded-lg hover:bg-yellow-50 transition border-yellow-200"><input type="checkbox" checked={!!doubtful[currentQIndex]} onChange={() => setDoubtful(prev => ({ ...prev, [currentQIndex]: !prev[currentQIndex] }))} className="w-4 h-4 text-yellow-500 rounded focus:ring-yellow-500 accent-yellow-500" /><span className="text-yellow-700 font-bold text-xs flex items-center gap-1"><Flag size={12}/> Ragu-ragu</span></label></div></div><div className="mb-6">{currentQ.stimulus && (<div className="bg-slate-50 border border-slate-200 rounded-xl p-5 mb-6"><div className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">{currentQ.stimulusTitle || "Stimulus"}</div><div className="text-gray-700 leading-relaxed whitespace-pre-wrap">{currentQ.stimulus}</div></div>)}<p className="text-xl text-gray-800 font-medium leading-relaxed whitespace-pre-wrap">{currentQ.text}</p></div><div className="flex-1"><QuestionRenderer question={currentQ} currentAnswer={answers[currentQ.id]} onAnswer={(val) => setAnswers(p => ({...p, [currentQ.id]: val}))} /></div><div className="mt-8 pt-6 border-t flex justify-between"><button disabled={currentQIndex===0} onClick={()=>setCurrentQIndex(c=>c-1)} className="px-6 py-3 bg-gray-100 text-gray-600 rounded-lg font-bold hover:bg-gray-200 disabled:opacity-50 flex items-center gap-2"><ChevronLeft size={20}/> Sebelumnya</button>{currentQIndex === examData.questions.length - 1 ? <button onClick={() => setShowFinishConfirm(true)} className="px-8 py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 shadow-lg flex items-center gap-2">Selesai Ujian <CheckCircle size={20}/></button> : <button onClick={()=>setCurrentQIndex(c=>c+1)} className="px-6 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 flex items-center gap-2">Selanjutnya <ChevronRight size={20}/></button>}</div></div>
-                        <div className="w-full md:w-80 shrink-0 order-last md:order-none mt-6 md:mt-0"><div className="bg-white p-4 rounded-xl shadow-sm sticky top-24"><h3 className="font-bold text-gray-700 mb-4 flex items-center gap-2"><Grid size={18}/> Navigasi Soal</h3><div className="grid grid-cols-6 md:grid-cols-5 gap-2">{examData.questions.map((q, idx) => { let isAnswered = false; if (q.type === 'complex') isAnswered = Array.isArray(answers[q.id]) && answers[q.id].length > 0; else if (q.type === 'statement') isAnswered = answers[q.id] && Object.keys(answers[q.id]).length > 0; else isAnswered = !!answers[q.id]; const isDoubt = !!doubtful[idx]; let btnClass = 'bg-gray-100 text-gray-500 border-transparent hover:bg-gray-200'; if (isAnswered) btnClass = 'bg-blue-600 text-white border-blue-600'; if (isDoubt) btnClass = 'bg-yellow-400 text-white border-yellow-400'; if (currentQIndex === idx) btnClass += ' ring-2 ring-offset-2 ring-blue-400'; return <button key={idx} onClick={() => setCurrentQIndex(idx)} className={`aspect-square rounded-lg font-bold text-sm border-2 transition ${btnClass}`}>{idx + 1}</button> })}</div></div></div>
+                <div className="min-h-screen bg-slate-100 flex flex-col">
+                    {!isFullscreen && (
+                        <div className="fixed inset-0 z-[9999] bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-white">
+                            <div className="mb-4 rounded-full bg-red-500/15 border border-red-400/40 px-4 py-2 text-red-200 text-sm font-extrabold">
+                                ⚠ PELANGGARAN {violationCount > 0 ? `${violationCount}/3` : 'TERDETEKSI'}
+                            </div>
+                            <h2 className="text-2xl font-bold mb-4">
+                                {violationCount >= 3 ? 'Batas Pelanggaran Tercapai' : violationCount > 0 ? 'Pelanggaran Tercatat!' : 'Mode Layar Penuh Diperlukan'}
+                            </h2>
+                            <p className="mb-3 max-w-xl opacity-90 leading-relaxed">
+                                {violationCount > 0
+                                    ? `Anda keluar dari mode layar penuh. Tindakan ini tercatat sebagai pelanggaran ke-${violationCount} dari maksimal 3 kali.`
+                                    : 'Ujian harus dikerjakan dalam mode layar penuh. Silakan masuk kembali ke layar penuh untuk melanjutkan.'}
+                            </p>
+                            <p className="mb-6 max-w-xl text-sm opacity-75">
+                                {violationCount >= 3
+                                    ? 'Batas pelanggaran telah tercapai. Ujian diselesaikan otomatis dan jawaban yang tersimpan akan dikirim.'
+                                    : 'Tetap berada di halaman ujian. Keluar dari layar penuh kembali akan menambah jumlah pelanggaran.'}
+                            </p>
+                            {violationCount >= 3 ? (
+                                <button onClick={submitExam} className="bg-emerald-600 hover:bg-emerald-700 px-10 py-3 rounded-lg font-bold">
+                                    Kirim Hasil Ujian
+                                </button>
+                            ) : (
+                                <button onClick={forceFullscreen} className="bg-blue-600 hover:bg-blue-700 px-10 py-3 rounded-lg font-bold">
+                                    Kembali ke Layar Penuh
+                                </button>
+                            )}
+                        </div>
+                    )}
+
+                    <ConfirmationModal
+                        isOpen={showFinishConfirm}
+                        title="Selesaikan Ujian?"
+                        message="Yakin sudah selesai?"
+                        confirmText="Ya, Selesai"
+                        onConfirm={() => { submitExam(); setShowFinishConfirm(false); }}
+                        onCancel={() => setShowFinishConfirm(false)}
+                    />
+
+                    <header className="bg-gradient-to-r from-sky-800 via-blue-700 to-blue-600 text-white shadow-md">
+                        <div className="max-w-7xl mx-auto px-4 md:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 rounded-lg bg-white/15 border border-white/20 flex items-center justify-center font-black text-lg">TKA</div>
+                                <div>
+                                    <h1 className="font-extrabold tracking-wide text-sm md:text-base">SIMULASI TKA SD/MI</h1>
+                                    <p className="text-[11px] text-blue-100">{examData.title || 'Latihan TKA'} · {studentData.school}</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-3 md:gap-5">
+                                <div className="rounded-full bg-red-600 text-white px-3 py-1.5 text-[10px] md:text-xs font-extrabold shadow-sm whitespace-nowrap">
+                                    ⚠ Pelanggaran: {violationCount}/3
+                                </div>
+                                <div className="hidden sm:block text-right">
+                                    <p className="text-sm font-semibold">{studentData.name}</p>
+                                    <p className="text-[11px] text-blue-100">NISN: {studentData.nisn}</p>
+                                </div>
+                                <div className={`font-mono font-bold text-base md:text-lg px-3 py-2 rounded-lg flex items-center gap-2 ${timeLeft < 300 ? 'bg-red-500 text-white' : 'bg-white/15 text-white border border-white/20'}`}>
+                                    <Clock size={18}/> {formatTime(timeLeft)}
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 w-full max-w-7xl mx-auto px-3 md:px-6 py-4 md:py-6">
+                        <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-visible">
+                            <div className="px-4 md:px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+                                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                    <h2 className="font-extrabold text-slate-800">Soal nomor {currentQIndex + 1}</h2>
+                                    <span className="text-xs text-slate-500">({currentQIndex + 1} dari {examData.questions.length})</span>
+                                    <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-100">
+                                        {currentQ.type === 'single' ? 'Pilihan Ganda' : currentQ.type === 'complex' ? 'Pilihan Ganda Kompleks' : 'Kategori / Pernyataan'}
+                                    </span>
+                                </div>
+                                <button
+                                    onClick={() => setShowQuestionList(v => !v)}
+                                    className="px-3 py-2 rounded-lg border border-blue-200 text-blue-700 text-xs font-bold hover:bg-blue-50 flex items-center gap-2"
+                                >
+                                    <Grid size={15}/> {showQuestionList ? 'Tutup Daftar Soal' : 'Daftar Soal'}
+                                </button>
+                            </div>
+
+                            <div className="px-4 md:px-6 pt-3">
+                                <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden">
+                                    <div className="h-full bg-blue-600 rounded-full transition-all" style={{width: `${((currentQIndex + 1) / examData.questions.length) * 100}%`}} />
+                                </div>
+                            </div>
+
+                            {showQuestionList && (
+                                <div className="mx-4 md:mx-6 mt-3 p-4 rounded-xl border border-blue-100 bg-blue-50">
+                                    <h3 className="font-bold text-sm text-slate-700 mb-3">Pilih nomor soal</h3>
+                                    <div className="grid grid-cols-6 sm:grid-cols-10 md:grid-cols-12 gap-2">
+                                        {examData.questions.map((q, idx) => {
+                                            let isAnswered = false;
+                                            if (q.type === 'complex') isAnswered = Array.isArray(answers[q.id]) && answers[q.id].length > 0;
+                                            else if (q.type === 'statement') isAnswered = answers[q.id] && Object.keys(answers[q.id]).length > 0;
+                                            else isAnswered = !!answers[q.id];
+                                            const isDoubt = !!doubtful[idx];
+                                            const cls = currentQIndex === idx
+                                                ? 'bg-blue-700 text-white border-blue-700 ring-2 ring-blue-200'
+                                                : isDoubt
+                                                    ? 'bg-amber-400 text-white border-amber-400'
+                                                    : isAnswered
+                                                        ? 'bg-emerald-600 text-white border-emerald-600'
+                                                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100';
+                                            return (
+                                                <button key={idx} onClick={() => { setCurrentQIndex(idx); setShowQuestionList(false); }}
+                                                    className={`h-9 rounded-lg border text-sm font-bold ${cls}`}>
+                                                    {idx + 1}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    <div className="flex flex-wrap gap-4 mt-3 text-[11px] text-slate-600">
+                                        <span><i className="inline-block w-2.5 h-2.5 rounded-sm bg-emerald-600 mr-1"/> Sudah dijawab</span>
+                                        <span><i className="inline-block w-2.5 h-2.5 rounded-sm bg-amber-400 mr-1"/> Ragu-ragu</span>
+                                        <span><i className="inline-block w-2.5 h-2.5 rounded-sm bg-white border mr-1"/> Belum dijawab</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div
+                                className="grid grid-cols-1 lg:grid-cols-2 gap-0 px-4 md:px-6 py-4 md:py-5 select-none"
+                                onCopy={(event) => event.preventDefault()}
+                                onCut={(event) => event.preventDefault()}
+                                onContextMenu={(event) => event.preventDefault()}
+                                onDragStart={(event) => event.preventDefault()}
+                            >
+                                <section className="min-w-0 lg:pr-5 lg:border-r border-slate-200">
+                                    <div className="flex items-center justify-between mb-3">
+                                        <h3 className="text-sm font-extrabold text-slate-700">{currentQ.stimulusTitle || 'Bacaan / Stimulus'}</h3>
+                                        <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Bahan bacaan</span>
+                                    </div>
+                                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 md:p-5 min-h-[260px] max-h-[58vh] overflow-y-auto">
+                                        {currentQ.stimulus ? (
+                                            <div className="text-[14px] md:text-[15px] leading-7 text-slate-700 whitespace-pre-wrap">{currentQ.stimulus}</div>
+                                        ) : (
+                                            <div className="min-h-[220px] flex items-center justify-center text-center text-sm text-slate-400">
+                                                Tidak ada stimulus khusus untuk soal ini. Bacalah pertanyaan di panel sebelah kanan.
+                                            </div>
+                                        )}
+                                    </div>
+                                </section>
+
+                                <section className="min-w-0 lg:pl-5 pt-5 lg:pt-0">
+                                    <div className="mb-4">
+                                        <h3 className="text-sm font-extrabold text-slate-700 mb-3">Pertanyaan</h3>
+                                        <p className="text-[15px] md:text-base text-slate-800 font-medium leading-7 whitespace-pre-wrap">{currentQ.text}</p>
+                                    </div>
+                                    <div className="border-t border-slate-100 pt-4">
+                                        <p className="text-xs font-bold text-slate-500 mb-3">
+                                            {currentQ.type === 'statement' ? 'Pilih Benar atau Salah untuk setiap pernyataan berikut:' : currentQ.type === 'complex' ? 'Pilih semua jawaban yang benar:' : 'Pilih satu jawaban yang paling tepat:'}
+                                        </p>
+                                        <QuestionRenderer question={currentQ} currentAnswer={answers[currentQ.id]} onAnswer={(val) => setAnswers(p => ({...p, [currentQ.id]: val}))} />
+                                    </div>
+                                </section>
+                            </div>
+
+                            <div className="px-4 md:px-6 py-4 border-t border-slate-200 bg-slate-50/70 rounded-b-2xl flex flex-wrap items-center justify-between gap-3">
+                                <button disabled={currentQIndex===0} onClick={()=>setCurrentQIndex(c=>c-1)}
+                                    className="px-4 md:px-5 py-2.5 bg-rose-700 text-white rounded-full text-xs md:text-sm font-bold hover:bg-rose-800 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 shadow-sm">
+                                    <ChevronLeft size={16}/> Soal sebelumnya
+                                </button>
+                                <button onClick={() => setDoubtful(prev => ({...prev, [currentQIndex]: !prev[currentQIndex]}))}
+                                    className={`px-5 md:px-6 py-2.5 rounded-full text-xs md:text-sm font-bold flex items-center gap-2 shadow-sm ${doubtful[currentQIndex] ? 'bg-amber-500 text-white' : 'bg-amber-400 text-amber-950 hover:bg-amber-500'}`}>
+                                    <Flag size={15}/> {doubtful[currentQIndex] ? 'Hapus Ragu-ragu' : 'Ragu-ragu'}
+                                </button>
+                                {currentQIndex === examData.questions.length - 1 ? (
+                                    <button onClick={() => setShowFinishConfirm(true)} className="px-5 md:px-6 py-2.5 bg-emerald-700 text-white rounded-full text-xs md:text-sm font-bold hover:bg-emerald-800 shadow-sm flex items-center gap-2">
+                                        Selesai Ujian <CheckCircle size={16}/>
+                                    </button>
+                                ) : (
+                                    <button onClick={()=>setCurrentQIndex(c=>c+1)} className="px-5 md:px-6 py-2.5 bg-blue-700 text-white rounded-full text-xs md:text-sm font-bold hover:bg-blue-800 shadow-sm flex items-center gap-2">
+                                        Soal berikutnya <ChevronRight size={16}/>
+                                    </button>
+                                )}
+                            </div>
+                        </section>
                     </main>
+                    <footer className="text-center text-[10px] text-slate-400 pb-3">SIMULASI TKA SD/MI · Jawaban tersimpan otomatis selama pengerjaan</footer>
                 </div>
             );
         };
